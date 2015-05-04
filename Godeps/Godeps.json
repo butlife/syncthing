@@ -1,6 +1,6 @@
 {
 	"ImportPath": "github.com/syncthing/syncthing",
-	"GoVersion": "devel",
+	"GoVersion": "go1.4.2",
 	"Packages": [
 		"./cmd/..."
 	],
@@ -8,6 +8,11 @@
 		{
 			"ImportPath": "github.com/bkaradzic/go-lz4",
 			"Rev": "4f7c2045dbd17b802370e2e6022200468abf02ba"
+		},
+		{
+			"ImportPath": "github.com/boltdb/bolt",
+			"Comment": "v1.0-113-g980670a",
+			"Rev": "980670afcebfd86727505b3061d8667195234816"
 		},
 		{
 			"ImportPath": "github.com/calmh/logger",
