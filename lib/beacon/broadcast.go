@@ -11,6 +11,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/thejerf/suture"
 )
 
@@ -19,6 +20,8 @@ type Broadcast struct {
 	port   int
 	inbox  chan []byte
 	outbox chan recv
+	br     *broadcastReader
+	bw     *broadcastWriter
 }
 
 func NewBroadcast(port int) *Broadcast {
@@ -31,9 +34,7 @@ func NewBroadcast(port int) *Broadcast {
 			FailureBackoff:   60 * time.Second,
 			// Only log restarts in debug mode.
 			Log: func(line string) {
-				if debug {
-					l.Debugln(line)
-				}
+				l.Debugln(line)
 			},
 		}),
 		port:   port,
@@ -41,14 +42,18 @@ func NewBroadcast(port int) *Broadcast {
 		outbox: make(chan recv, 16),
 	}
 
-	b.Add(&broadcastReader{
-		port:   port,
-		outbox: b.outbox,
-	})
-	b.Add(&broadcastWriter{
-		port:  port,
-		inbox: b.inbox,
-	})
+	b.br = &broadcastReader{
+		port:    port,
+		outbox:  b.outbox,
+		connMut: sync.NewMutex(),
+	}
+	b.Add(b.br)
+	b.bw = &broadcastWriter{
+		port:    port,
+		inbox:   b.inbox,
+		connMut: sync.NewMutex(),
+	}
+	b.Add(b.bw)
 
 	return b
 }
@@ -62,38 +67,42 @@ func (b *Broadcast) Recv() ([]byte, net.Addr) {
 	return recv.data, recv.src
 }
 
+func (b *Broadcast) Error() error {
+	if err := b.br.Error(); err != nil {
+		return err
+	}
+	return b.bw.Error()
+}
+
 type broadcastWriter struct {
-	port   int
-	inbox  chan []byte
-	conn   *net.UDPConn
-	failed bool // Have we already logged a failure reason?
+	port    int
+	inbox   chan []byte
+	conn    *net.UDPConn
+	connMut sync.Mutex
+	errorHolder
 }
 
 func (w *broadcastWriter) Serve() {
-	if debug {
-		l.Debugln(w, "starting")
-		defer l.Debugln(w, "stopping")
-	}
+	l.Debugln(w, "starting")
+	defer l.Debugln(w, "stopping")
 
-	var err error
-	w.conn, err = net.ListenUDP("udp4", nil)
+	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
-		if !w.failed {
-			l.Warnln("Local discovery over IPv4 unavailable:", err)
-			w.failed = true
-		}
+		l.Debugln(err)
+		w.setError(err)
 		return
 	}
-	defer w.conn.Close()
+	defer conn.Close()
 
-	w.failed = false
+	w.connMut.Lock()
+	w.conn = conn
+	w.connMut.Unlock()
 
 	for bs := range w.inbox {
 		addrs, err := net.InterfaceAddrs()
 		if err != nil {
-			if debug {
-				l.Debugln("Local discovery (broadcast writer):", err)
-			}
+			l.Debugln(err)
+			w.setError(err)
 			continue
 		}
 
@@ -110,41 +119,53 @@ func (w *broadcastWriter) Serve() {
 			dsts = append(dsts, net.IP{0xff, 0xff, 0xff, 0xff})
 		}
 
-		if debug {
-			l.Debugln("addresses:", dsts)
-		}
+		l.Debugln("addresses:", dsts)
 
+		success := 0
 		for _, ip := range dsts {
 			dst := &net.UDPAddr{IP: ip, Port: w.port}
 
-			w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_, err := w.conn.WriteTo(bs, dst)
+			conn.SetWriteDeadline(time.Now().Add(time.Second))
+			_, err := conn.WriteTo(bs, dst)
+			conn.SetWriteDeadline(time.Time{})
+
 			if err, ok := err.(net.Error); ok && err.Timeout() {
 				// Write timeouts should not happen. We treat it as a fatal
 				// error on the socket.
-				l.Infoln("Local discovery (broadcast writer):", err)
-				w.failed = true
+				l.Debugln(err)
+				w.setError(err)
 				return
-			} else if err, ok := err.(net.Error); ok && err.Temporary() {
-				// A transient error. Lets hope for better luck in the future.
-				if debug {
-					l.Debugln(err)
-				}
-				continue
-			} else if err != nil {
-				// Some other error that we don't expect. Bail and retry.
-				l.Infoln("Local discovery (broadcast writer):", err)
-				w.failed = true
-				return
-			} else if debug {
-				l.Debugf("sent %d bytes to %s", len(bs), dst)
 			}
+
+			if err, ok := err.(net.Error); ok && err.Temporary() {
+				// A transient error. Lets hope for better luck in the future.
+				l.Debugln(err)
+				continue
+			}
+
+			if err != nil {
+				// Some other error that we don't expect. Bail and retry.
+				l.Debugln(err)
+				w.setError(err)
+				return
+			}
+
+			l.Debugf("sent %d bytes to %s", len(bs), dst)
+			success++
+		}
+
+		if success > 0 {
+			w.setError(nil)
 		}
 	}
 }
 
 func (w *broadcastWriter) Stop() {
-	w.conn.Close()
+	w.connMut.Lock()
+	if w.conn != nil {
+		w.conn.Close()
+	}
+	w.connMut.Unlock()
 }
 
 func (w *broadcastWriter) String() string {
@@ -152,61 +173,59 @@ func (w *broadcastWriter) String() string {
 }
 
 type broadcastReader struct {
-	port   int
-	outbox chan recv
-	conn   *net.UDPConn
-	failed bool
+	port    int
+	outbox  chan recv
+	conn    *net.UDPConn
+	connMut sync.Mutex
+	errorHolder
 }
 
 func (r *broadcastReader) Serve() {
-	if debug {
-		l.Debugln(r, "starting")
-		defer l.Debugln(r, "stopping")
-	}
+	l.Debugln(r, "starting")
+	defer l.Debugln(r, "stopping")
 
-	var err error
-	r.conn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: r.port})
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: r.port})
 	if err != nil {
-		if !r.failed {
-			l.Warnln("Local discovery over IPv4 unavailable:", err)
-			r.failed = true
-		}
+		l.Debugln(err)
+		r.setError(err)
 		return
 	}
-	defer r.conn.Close()
+	defer conn.Close()
+
+	r.connMut.Lock()
+	r.conn = conn
+	r.connMut.Unlock()
 
 	bs := make([]byte, 65536)
 	for {
-		n, addr, err := r.conn.ReadFrom(bs)
+		n, addr, err := conn.ReadFrom(bs)
 		if err != nil {
-			if !r.failed {
-				l.Infoln("Local discovery (broadcast reader):", err)
-				r.failed = true
-			}
+			l.Debugln(err)
+			r.setError(err)
 			return
 		}
 
-		r.failed = false
+		r.setError(nil)
 
-		if debug {
-			l.Debugf("recv %d bytes from %s", n, addr)
-		}
+		l.Debugf("recv %d bytes from %s", n, addr)
 
 		c := make([]byte, n)
 		copy(c, bs)
 		select {
 		case r.outbox <- recv{c, addr}:
 		default:
-			if debug {
-				l.Debugln("dropping message")
-			}
+			l.Debugln("dropping message")
 		}
 	}
 
 }
 
 func (r *broadcastReader) Stop() {
-	r.conn.Close()
+	r.connMut.Lock()
+	if r.conn != nil {
+		r.conn.Close()
+	}
+	r.connMut.Unlock()
 }
 
 func (r *broadcastReader) String() string {

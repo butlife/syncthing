@@ -1,5 +1,11 @@
-<modal id="about" large="yes" close="yes" status="info" title="{{'About' | translate}}">
-  <h1 class="text-center"><img alt="Syncthing" title="Syncthing" src="assets/img/logo-horizontal.svg" style="vertical-align: -16px" height="100" width="366"/><br/><small>{{versionString()}}</small></h1>
+<modal id="about" status="info" icon="heart-o" title="{{'About' | translate}}" large="yes" close="yes">
+  <h1 class="text-center">
+    <img alt="Syncthing" title="Syncthing" src="assets/img/logo-horizontal.svg" style="vertical-align: -16px" height="100" width="366"/>
+    <br/>
+    <small>{{versionString()}}</small>
+    <br/>
+    <small><i>"{{version.codename}}"</i></small>
+  </h1>
   <hr/>
 
   <p translate>Copyright &copy; 2015 the following Contributors:</p>
@@ -7,6 +13,7 @@
     <div class="col-md-12">
       <ul class="list-unstyled three-columns" id="contributor-list">
         <li class="auto-generated">Aaron Bieber</li>
+        <li class="auto-generated">Adam Piggott</li>
         <li class="auto-generated">Alexander Graf</li>
         <li class="auto-generated">Andrew Dunham</li>
         <li class="auto-generated">Antony Male</li>
@@ -40,6 +47,7 @@
         <li class="auto-generated">Frank Isemann</li>
         <li class="auto-generated">Gilli Sigurdsson</li>
         <li class="auto-generated">Jacek Szafarkiewicz</li>
+        <li class="auto-generated">Jake Peterson</li>
         <li class="auto-generated">Jakob Borg</li>
         <li class="auto-generated">James Patterson</li>
         <li class="auto-generated">Jaroslav Malec</li>
@@ -53,6 +61,8 @@
         <li class="auto-generated">Marc Laporte</li>
         <li class="auto-generated">Marc Pujol</li>
         <li class="auto-generated">Marcin Dziadus</li>
+        <li class="auto-generated">Mateusz Naściszewski</li>
+        <li class="auto-generated">Matt Burke</li>
         <li class="auto-generated">Michael Jephcote</li>
         <li class="auto-generated">Michael Tilli</li>
         <li class="auto-generated">Pascal Jungblut</li>
@@ -62,6 +72,7 @@
         <li class="auto-generated">Piotr Bejda</li>
         <li class="auto-generated">Ryan Sullivan</li>
         <li class="auto-generated">Sergey Mishin</li>
+        <li class="auto-generated">Stefan Kuntz</li>
         <li class="auto-generated">Stefan Tatschner</li>
         <li class="auto-generated">Tim Abell</li>
         <li class="auto-generated">Tobias Nygren</li>
@@ -69,6 +80,7 @@
         <li class="auto-generated">Tully Robinson</li>
         <li class="auto-generated">Veeti Paananen</li>
         <li class="auto-generated">Vil Brekin</li>
+        <li class="auto-generated">Yannic A.</li>
       </ul>
     </div>
   </div>
@@ -86,5 +98,6 @@
     <li><a href="https://github.com/vitrun/qart">vitrun/qart</a>, Copyright &copy; The Go Authors.</li>
     <li><a href="https://angularjs.org/">AngularJS</a>, Copyright &copy; 2010-2015 Google, Inc.</li>
     <li><a href="http://getbootstrap.com/">Bootstrap</a>, Copyright &copy; 2011-2015 Twitter, Inc.</li>
+    <li><a href="http://fontawesome.io/">Font Awesome</a>, Copyright &copy; 2015 Dave Gandy</li>
   </ul>
 </modal>

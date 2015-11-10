@@ -6,10 +6,8 @@ Suture
 Suture provides Erlang-ish supervisor trees for Go. "Supervisor trees" ->
 "sutree" -> "suture" -> holds your code together when it's trying to die.
 
-This is intended to be a production-quality library going into code that I
-will be very early on the phone tree to support when it goes down. However,
-it has not been deployed into something quite that serious yet. (I will
-update this statement when that changes.)
+This library has hit maturity, and isn't expected to be changed
+radically. This can also be imported via gopkg.in/thejerf/suture.v1 .
 
 It is intended to deal gracefully with the real failure cases that can
 occur with supervision trees (such as burning all your CPU time endlessly
@@ -23,10 +21,6 @@ is available.
 This module is fully covered with [godoc](http://godoc.org/github.com/thejerf/suture),
 including an example, usage, and everything else you might expect from a
 README.md on GitHub. (DRY.)
-
-This is not currently tagged with particular git tags for Go as this is
-currently considered to be alpha code. As I move this into production and
-feel more confident about it, I'll give it relevant tags.
 
 Code Signing
 ------------
@@ -43,3 +37,14 @@ easily fit into the OTP paradigm. It ought to someday be considered a good
 idea to distribute libraries that provide some sort of supervisor tree
 functionality out of the box. It is possible to provide this functionality
 without explicitly depending on the Suture library.
+
+Changelog
+---------
+
+suture uses semantic versioning.
+
+1. 1.0.0
+  * Initial release.
+2. 1.0.1
+  * Fixed data race on the .state variable.
+

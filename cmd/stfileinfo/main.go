@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/syncthing/protocol"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 )
 
@@ -68,7 +68,7 @@ func main() {
 		if *standardBlocks || blockSize < protocol.BlockSize {
 			blockSize = protocol.BlockSize
 		}
-		bs, err := scanner.Blocks(fd, blockSize, fi.Size())
+		bs, err := scanner.Blocks(fd, blockSize, fi.Size(), nil)
 		if err != nil {
 			log.Fatal(err)
 		}

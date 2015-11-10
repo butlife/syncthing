@@ -20,65 +20,70 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/calmh/logger"
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/auto"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/logger"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/relay"
 	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/vitrun/qart/qr"
 	"golang.org/x/crypto/bcrypt"
 )
 
-type guiError struct {
-	Time  time.Time `json:"time"`
-	Error string    `json:"error"`
-}
-
 var (
 	configInSync = true
-	guiErrors    = []guiError{}
-	guiErrorsMut = sync.NewMutex()
 	startTime    = time.Now()
 )
 
 type apiSvc struct {
 	id              protocol.DeviceID
-	cfg             config.GUIConfiguration
+	cfg             *config.Wrapper
 	assetDir        string
 	model           *model.Model
+	eventSub        *events.BufferedSubscription
+	discoverer      *discover.CachingMux
+	relaySvc        *relay.Svc
 	listener        net.Listener
 	fss             *folderSummarySvc
 	stop            chan struct{}
 	systemConfigMut sync.Mutex
-	eventSub        *events.BufferedSubscription
+
+	guiErrors *logger.Recorder
+	systemLog *logger.Recorder
 }
 
-func newAPISvc(id protocol.DeviceID, cfg config.GUIConfiguration, assetDir string, m *model.Model, eventSub *events.BufferedSubscription) (*apiSvc, error) {
+func newAPISvc(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m *model.Model, eventSub *events.BufferedSubscription, discoverer *discover.CachingMux, relaySvc *relay.Svc, errors, systemLog *logger.Recorder) (*apiSvc, error) {
 	svc := &apiSvc{
 		id:              id,
 		cfg:             cfg,
 		assetDir:        assetDir,
 		model:           m,
-		systemConfigMut: sync.NewMutex(),
 		eventSub:        eventSub,
+		discoverer:      discoverer,
+		relaySvc:        relaySvc,
+		systemConfigMut: sync.NewMutex(),
+		guiErrors:       errors,
+		systemLog:       systemLog,
 	}
 
 	var err error
-	svc.listener, err = svc.getListener(cfg)
+	svc.listener, err = svc.getListener(cfg.GUI())
 	return svc, err
 }
 
-func (s *apiSvc) getListener(cfg config.GUIConfiguration) (net.Listener, error) {
+func (s *apiSvc) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
 	cert, err := tls.LoadX509KeyPair(locations[locHTTPSCertFile], locations[locHTTPSKeyFile])
 	if err != nil {
 		l.Infoln("Loading HTTPS certificate:", err)
@@ -92,7 +97,7 @@ func (s *apiSvc) getListener(cfg config.GUIConfiguration) (net.Listener, error) 
 			name = tlsDefaultCommonName
 		}
 
-		cert, err = newCertificate(locations[locHTTPSCertFile], locations[locHTTPSKeyFile], name)
+		cert, err = tlsutil.NewCertificate(locations[locHTTPSCertFile], locations[locHTTPSKeyFile], name, tlsRSABits)
 	}
 	if err != nil {
 		return nil, err
@@ -115,19 +120,17 @@ func (s *apiSvc) getListener(cfg config.GUIConfiguration) (net.Listener, error) 
 		},
 	}
 
-	rawListener, err := net.Listen("tcp", cfg.Address)
+	rawListener, err := net.Listen("tcp", guiCfg.Address())
 	if err != nil {
 		return nil, err
 	}
 
-	listener := &DowngradingListener{rawListener, tlsCfg}
+	listener := &tlsutil.DowngradingListener{rawListener, tlsCfg}
 	return listener, nil
 }
 
 func (s *apiSvc) Serve() {
 	s.stop = make(chan struct{})
-
-	l.AddHandler(logger.LevelWarn, s.showGuiError)
 
 	// The GET handlers
 	getRestMux := http.NewServeMux()
@@ -153,6 +156,9 @@ func (s *apiSvc) Serve() {
 	getRestMux.HandleFunc("/rest/system/status", s.getSystemStatus)              // -
 	getRestMux.HandleFunc("/rest/system/upgrade", s.getSystemUpgrade)            // -
 	getRestMux.HandleFunc("/rest/system/version", s.getSystemVersion)            // -
+	getRestMux.HandleFunc("/rest/system/debug", s.getSystemDebug)                // -
+	getRestMux.HandleFunc("/rest/system/log", s.getSystemLog)                    // [since]
+	getRestMux.HandleFunc("/rest/system/log.txt", s.getSystemLogTxt)             // [since]
 
 	// The POST handlers
 	postRestMux := http.NewServeMux()
@@ -161,7 +167,6 @@ func (s *apiSvc) Serve() {
 	postRestMux.HandleFunc("/rest/db/override", s.postDBOverride)              // folder
 	postRestMux.HandleFunc("/rest/db/scan", s.postDBScan)                      // folder [sub...] [delay]
 	postRestMux.HandleFunc("/rest/system/config", s.postSystemConfig)          // <body>
-	postRestMux.HandleFunc("/rest/system/discovery", s.postSystemDiscovery)    // device addr
 	postRestMux.HandleFunc("/rest/system/error", s.postSystemError)            // <body>
 	postRestMux.HandleFunc("/rest/system/error/clear", s.postSystemErrorClear) // -
 	postRestMux.HandleFunc("/rest/system/ping", s.restPing)                    // -
@@ -169,6 +174,9 @@ func (s *apiSvc) Serve() {
 	postRestMux.HandleFunc("/rest/system/restart", s.postSystemRestart)        // -
 	postRestMux.HandleFunc("/rest/system/shutdown", s.postSystemShutdown)      // -
 	postRestMux.HandleFunc("/rest/system/upgrade", s.postSystemUpgrade)        // -
+	postRestMux.HandleFunc("/rest/system/pause", s.postSystemPause)            // device
+	postRestMux.HandleFunc("/rest/system/resume", s.postSystemResume)          // device
+	postRestMux.HandleFunc("/rest/system/debug", s.postSystemDebug)            // [enable] [disable]
 
 	// Debug endpoints, not for general use
 	getRestMux.HandleFunc("/rest/debug/peerCompletion", s.getPeerCompletion)
@@ -188,37 +196,38 @@ func (s *apiSvc) Serve() {
 		assets:   auto.Assets(),
 	})
 
+	guiCfg := s.cfg.GUI()
+
 	// Wrap everything in CSRF protection. The /rest prefix should be
 	// protected, other requests will grant cookies.
-	handler := csrfMiddleware(s.id.String()[:5], "/rest", s.cfg.APIKey, mux)
+	handler := csrfMiddleware(s.id.String()[:5], "/rest", guiCfg.APIKey(), mux)
 
 	// Add our version and ID as a header to responses
 	handler = withDetailsMiddleware(s.id, handler)
 
 	// Wrap everything in basic auth, if user/password is set.
-	if len(s.cfg.User) > 0 && len(s.cfg.Password) > 0 {
-		handler = basicAuthAndSessionMiddleware("sessionid-"+s.id.String()[:5], s.cfg, handler)
+	if len(guiCfg.User) > 0 && len(guiCfg.Password) > 0 {
+		handler = basicAuthAndSessionMiddleware("sessionid-"+s.id.String()[:5], guiCfg, handler)
 	}
 
 	// Redirect to HTTPS if we are supposed to
-	if s.cfg.UseTLS {
+	if guiCfg.UseTLS() {
 		handler = redirectToHTTPSMiddleware(handler)
 	}
 
-	if debugHTTP {
-		handler = debugMiddleware(handler)
-	}
+	handler = debugMiddleware(handler)
 
 	srv := http.Server{
 		Handler:     handler,
 		ReadTimeout: 10 * time.Second,
 	}
 
-	s.fss = newFolderSummarySvc(s.model)
+	s.fss = newFolderSummarySvc(s.cfg, s.model)
 	defer s.fss.Stop()
 	s.fss.ServeBackground()
 
 	l.Infoln("API listening on", s.listener.Addr())
+	l.Infoln("GUI URL is", guiCfg.URL())
 	err := srv.Serve(s.listener)
 
 	// The return could be due to an intentional close. Wait for the stop
@@ -266,7 +275,6 @@ func (s *apiSvc) CommitConfiguration(from, to config.Configuration) bool {
 		// method.
 		return false
 	}
-	s.cfg = to.GUI
 
 	close(s.stop)
 
@@ -355,10 +363,41 @@ func (s *apiSvc) getSystemVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]string{
 		"version":     Version,
+		"codename":    Codename,
 		"longVersion": LongVersion,
 		"os":          runtime.GOOS,
 		"arch":        runtime.GOARCH,
 	})
+}
+
+func (s *apiSvc) getSystemDebug(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	names := l.Facilities()
+	enabled := l.FacilityDebugging()
+	sort.Strings(enabled)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"facilities": names,
+		"enabled":    enabled,
+	})
+}
+
+func (s *apiSvc) postSystemDebug(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	q := r.URL.Query()
+	for _, f := range strings.Split(q.Get("enable"), ",") {
+		if f == "" {
+			continue
+		}
+		l.SetDebug(f, true)
+		l.Infof("Enabled debug data for %q", f)
+	}
+	for _, f := range strings.Split(q.Get("disable"), ",") {
+		if f == "" {
+			continue
+		}
+		l.SetDebug(f, false)
+		l.Infof("Disabled debug data for %q", f)
+	}
 }
 
 func (s *apiSvc) getDBBrowse(w http.ResponseWriter, r *http.Request) {
@@ -401,12 +440,12 @@ func (s *apiSvc) getDBCompletion(w http.ResponseWriter, r *http.Request) {
 func (s *apiSvc) getDBStatus(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
-	res := folderSummary(s.model, folder)
+	res := folderSummary(s.cfg, s.model, folder)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(res)
 }
 
-func folderSummary(m *model.Model, folder string) map[string]interface{} {
+func folderSummary(cfg *config.Wrapper, m *model.Model, folder string) map[string]interface{} {
 	var res = make(map[string]interface{})
 
 	res["invalid"] = cfg.Folders()[folder].Invalid
@@ -516,22 +555,21 @@ func (s *apiSvc) getDBFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiSvc) getSystemConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(cfg.Raw())
+	json.NewEncoder(w).Encode(s.cfg.Raw())
 }
 
 func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	s.systemConfigMut.Lock()
 	defer s.systemConfigMut.Unlock()
 
-	var to config.Configuration
-	err := json.NewDecoder(r.Body).Decode(&to)
+	to, err := config.ReadJSON(r.Body, myID)
 	if err != nil {
 		l.Warnln("decoding posted config:", err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	if to.GUI.Password != cfg.GUI().Password {
+	if to.GUI.Password != s.cfg.GUI().Password {
 		if to.GUI.Password != "" {
 			hash, err := bcrypt.GenerateFromPassword([]byte(to.GUI.Password), 0)
 			if err != nil {
@@ -546,7 +584,7 @@ func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 
 	// Fixup usage reporting settings
 
-	if curAcc := cfg.Options().URAccepted; to.Options.URAccepted > curAcc {
+	if curAcc := s.cfg.Options().URAccepted; to.Options.URAccepted > curAcc {
 		// UR was enabled
 		to.Options.URAccepted = usageReportVersion
 		to.Options.URUniqueID = randomString(8)
@@ -558,9 +596,9 @@ func (s *apiSvc) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 
 	// Activate and save
 
-	resp := cfg.Replace(to)
+	resp := s.cfg.Replace(to)
 	configInSync = !resp.RequiresRestart
-	cfg.Save()
+	s.cfg.Save()
 }
 
 func (s *apiSvc) getSystemConfigInsync(w http.ResponseWriter, r *http.Request) {
@@ -578,7 +616,7 @@ func (s *apiSvc) postSystemReset(w http.ResponseWriter, r *http.Request) {
 	folder := qs.Get("folder")
 
 	if len(folder) > 0 {
-		if _, ok := cfg.Folders()[folder]; !ok {
+		if _, ok := s.cfg.Folders()[folder]; !ok {
 			http.Error(w, "Invalid folder ID", 500)
 			return
 		}
@@ -586,7 +624,7 @@ func (s *apiSvc) postSystemReset(w http.ResponseWriter, r *http.Request) {
 
 	if len(folder) == 0 {
 		// Reset all folders.
-		for folder := range cfg.Folders() {
+		for folder := range s.cfg.Folders() {
 			s.model.ResetFolder(folder)
 		}
 		s.flushResponse(`{"ok": "resetting database"}`, w)
@@ -624,8 +662,30 @@ func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	res["alloc"] = m.Alloc
 	res["sys"] = m.Sys - m.HeapReleased
 	res["tilde"] = tilde
-	if cfg.Options().GlobalAnnEnabled && discoverer != nil {
-		res["extAnnounceOK"] = discoverer.ExtAnnounceOK()
+	if s.cfg.Options().LocalAnnEnabled || s.cfg.Options().GlobalAnnEnabled {
+		res["discoveryEnabled"] = true
+		discoErrors := make(map[string]string)
+		discoMethods := 0
+		for disco, err := range s.discoverer.ChildErrors() {
+			discoMethods++
+			if err != nil {
+				discoErrors[disco] = err.Error()
+			}
+		}
+		res["discoveryMethods"] = discoMethods
+		res["discoveryErrors"] = discoErrors
+	}
+	if s.relaySvc != nil {
+		res["relaysEnabled"] = true
+		relayClientStatus := make(map[string]bool)
+		relayClientLatency := make(map[string]int)
+		for _, relay := range s.relaySvc.Relays() {
+			latency, ok := s.relaySvc.RelayStatus(relay)
+			relayClientStatus[relay] = ok
+			relayClientLatency[relay] = int(latency / time.Millisecond)
+		}
+		res["relayClientStatus"] = relayClientStatus
+		res["relayClientLatency"] = relayClientLatency
 	}
 	cpuUsageLock.RLock()
 	var cpusum float64
@@ -636,6 +696,7 @@ func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	res["cpuPercent"] = cpusum / float64(len(cpuUsagePercent)) / float64(runtime.NumCPU())
 	res["pathSeparator"] = string(filepath.Separator)
 	res["uptime"] = int(time.Since(startTime).Seconds())
+	res["startTime"] = startTime
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(res)
@@ -643,51 +704,53 @@ func (s *apiSvc) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiSvc) getSystemError(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	guiErrorsMut.Lock()
-	json.NewEncoder(w).Encode(map[string][]guiError{"errors": guiErrors})
-	guiErrorsMut.Unlock()
+	json.NewEncoder(w).Encode(map[string][]logger.Line{
+		"errors": s.guiErrors.Since(time.Time{}),
+	})
 }
 
 func (s *apiSvc) postSystemError(w http.ResponseWriter, r *http.Request) {
 	bs, _ := ioutil.ReadAll(r.Body)
 	r.Body.Close()
-	s.showGuiError(0, string(bs))
+	l.Warnln(string(bs))
 }
 
 func (s *apiSvc) postSystemErrorClear(w http.ResponseWriter, r *http.Request) {
-	guiErrorsMut.Lock()
-	guiErrors = []guiError{}
-	guiErrorsMut.Unlock()
+	s.guiErrors.Clear()
 }
 
-func (s *apiSvc) showGuiError(l logger.LogLevel, err string) {
-	guiErrorsMut.Lock()
-	guiErrors = append(guiErrors, guiError{time.Now(), err})
-	if len(guiErrors) > 5 {
-		guiErrors = guiErrors[len(guiErrors)-5:]
-	}
-	guiErrorsMut.Unlock()
+func (s *apiSvc) getSystemLog(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	since, err := time.Parse(time.RFC3339, q.Get("since"))
+	l.Debugln(err)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	json.NewEncoder(w).Encode(map[string][]logger.Line{
+		"messages": s.systemLog.Since(since),
+	})
 }
 
-func (s *apiSvc) postSystemDiscovery(w http.ResponseWriter, r *http.Request) {
-	var qs = r.URL.Query()
-	var device = qs.Get("device")
-	var addr = qs.Get("addr")
-	if len(device) != 0 && len(addr) != 0 && discoverer != nil {
-		discoverer.Hint(device, []string{addr})
+func (s *apiSvc) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	since, err := time.Parse(time.RFC3339, q.Get("since"))
+	l.Debugln(err)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+	for _, line := range s.systemLog.Since(since) {
+		fmt.Fprintf(w, "%s: %s\n", line.When.Format(time.RFC3339), line.Message)
 	}
 }
 
 func (s *apiSvc) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	devices := map[string][]discover.CacheEntry{}
+	devices := make(map[string]discover.CacheEntry)
 
-	if discoverer != nil {
+	if s.discoverer != nil {
 		// Device ids can't be marshalled as keys so we need to manually
 		// rebuild this map using strings. Discoverer may be nil if discovery
 		// has not started yet.
-		for device, entries := range discoverer.All() {
-			devices[device.String()] = entries
+		for device, entry := range s.discoverer.Cache() {
+			devices[device.String()] = entry
 		}
 	}
 
@@ -696,7 +759,7 @@ func (s *apiSvc) getSystemDiscovery(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiSvc) getReport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(reportData(s.model))
+	json.NewEncoder(w).Encode(reportData(s.cfg, s.model))
 }
 
 func (s *apiSvc) getDBIgnores(w http.ResponseWriter, r *http.Request) {
@@ -765,7 +828,7 @@ func (s *apiSvc) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, upgrade.ErrUpgradeUnsupported.Error(), 500)
 		return
 	}
-	rel, err := upgrade.LatestRelease(Version)
+	rel, err := upgrade.LatestRelease(s.cfg.Options().ReleasesURL, Version)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -808,7 +871,7 @@ func (s *apiSvc) getLang(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiSvc) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
-	rel, err := upgrade.LatestRelease(Version)
+	rel, err := upgrade.LatestRelease(s.cfg.Options().ReleasesURL, Version)
 	if err != nil {
 		l.Warnln("getting latest release:", err)
 		http.Error(w, err.Error(), 500)
@@ -827,6 +890,32 @@ func (s *apiSvc) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 		l.Infoln("Upgrading")
 		stop <- exitUpgrading
 	}
+}
+
+func (s *apiSvc) postSystemPause(w http.ResponseWriter, r *http.Request) {
+	var qs = r.URL.Query()
+	var deviceStr = qs.Get("device")
+
+	device, err := protocol.DeviceIDFromString(deviceStr)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	s.model.PauseDevice(device)
+}
+
+func (s *apiSvc) postSystemResume(w http.ResponseWriter, r *http.Request) {
+	var qs = r.URL.Query()
+	var deviceStr = qs.Get("device")
+
+	device, err := protocol.DeviceIDFromString(deviceStr)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	s.model.ResumeDevice(device)
 }
 
 func (s *apiSvc) postDBScan(w http.ResponseWriter, r *http.Request) {
@@ -880,7 +969,7 @@ func (s *apiSvc) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 	tot := map[string]float64{}
 	count := map[string]float64{}
 
-	for _, folder := range cfg.Folders() {
+	for _, folder := range s.cfg.Folders() {
 		for _, device := range folder.DeviceIDs() {
 			deviceStr := device.String()
 			if s.model.ConnectedTo(device) {

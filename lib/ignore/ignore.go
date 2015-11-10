@@ -206,45 +206,52 @@ func parseIgnoreFile(fd io.Reader, currentFile string, seen map[string]bool) ([]
 			include = false
 		}
 
+		flags := fnmatch.PathName
+		if strings.HasPrefix(line, "(?i)") {
+			line = line[4:]
+			flags |= fnmatch.CaseFold
+		}
+
 		if strings.HasPrefix(line, "/") {
 			// Pattern is rooted in the current dir only
-			exp, err := fnmatch.Convert(line[1:], fnmatch.PathName)
+			exp, err := fnmatch.Convert(line[1:], flags)
 			if err != nil {
-				return fmt.Errorf("Invalid pattern %q in ignore file", line)
+				return fmt.Errorf("invalid pattern %q in ignore file", line)
 			}
 			patterns = append(patterns, Pattern{exp, include})
 		} else if strings.HasPrefix(line, "**/") {
 			// Add the pattern as is, and without **/ so it matches in current dir
-			exp, err := fnmatch.Convert(line, fnmatch.PathName)
+			exp, err := fnmatch.Convert(line, flags)
 			if err != nil {
-				return fmt.Errorf("Invalid pattern %q in ignore file", line)
+				return fmt.Errorf("invalid pattern %q in ignore file", line)
 			}
 			patterns = append(patterns, Pattern{exp, include})
 
-			exp, err = fnmatch.Convert(line[3:], fnmatch.PathName)
+			exp, err = fnmatch.Convert(line[3:], flags)
 			if err != nil {
-				return fmt.Errorf("Invalid pattern %q in ignore file", line)
+				return fmt.Errorf("invalid pattern %q in ignore file", line)
 			}
 			patterns = append(patterns, Pattern{exp, include})
 		} else if strings.HasPrefix(line, "#include ") {
-			includeFile := filepath.Join(filepath.Dir(currentFile), line[len("#include "):])
+			includeRel := line[len("#include "):]
+			includeFile := filepath.Join(filepath.Dir(currentFile), includeRel)
 			includes, err := loadIgnoreFile(includeFile, seen)
 			if err != nil {
-				return err
+				return fmt.Errorf("include of %q: %v", includeRel, err)
 			}
 			patterns = append(patterns, includes...)
 		} else {
 			// Path name or pattern, add it so it matches files both in
 			// current directory and subdirs.
-			exp, err := fnmatch.Convert(line, fnmatch.PathName)
+			exp, err := fnmatch.Convert(line, flags)
 			if err != nil {
-				return fmt.Errorf("Invalid pattern %q in ignore file", line)
+				return fmt.Errorf("invalid pattern %q in ignore file", line)
 			}
 			patterns = append(patterns, Pattern{exp, include})
 
-			exp, err = fnmatch.Convert("**/"+line, fnmatch.PathName)
+			exp, err = fnmatch.Convert("**/"+line, flags)
 			if err != nil {
-				return fmt.Errorf("Invalid pattern %q in ignore file", line)
+				return fmt.Errorf("invalid pattern %q in ignore file", line)
 			}
 			patterns = append(patterns, Pattern{exp, include})
 		}

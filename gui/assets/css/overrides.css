@@ -14,10 +14,15 @@ body {
 
 h1, h2, h3, h4, h5 {
     font-family: "Raleway", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    line-height: 1.25;
 }
 
 ul+h5 {
     margin-top: 1.5em;
+}
+
+#content {
+    margin-bottom: 50px;
 }
 
 .panel-progress {
@@ -40,8 +45,17 @@ identicon {
     position: relative;
     width: 1em;
     height: 1em;
-    line-height: 1em;
-    overflow: visible;
+    line-height: 1;
+    margin-right: 5px;
+}
+
+.identicon {
+    width: 1em;
+    height: 1em;
+}
+
+.identicon rect {
+    fill: #333;
 }
 
 .checkbox {
@@ -54,30 +68,16 @@ identicon {
 
 .popover {
     max-width: none;
+    min-width: 250px;
 }
 
-.identicon {
-    width: 20px;
-    height: 20px;
-}
-
-.panel-heading .identicon {
-    display: block;
-    position: absolute;
-    top: 1px;
-}
-
-.panel-heading .glyphicon {
+.panel-heading .fa, .modal-header .fa {
     margin-right: 10px;
 }
 
 .panel-heading {
     position: relative;
     overflow: hidden;
-}
-
-.identicon rect {
-    fill: #666;
 }
 
 .text-monospace {

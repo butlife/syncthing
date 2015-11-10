@@ -1,21 +1,17 @@
 {
 	"ImportPath": "github.com/syncthing/syncthing",
-	"GoVersion": "devel",
+	"GoVersion": "go1.5.1",
 	"Packages": [
 		"./cmd/..."
 	],
 	"Deps": [
 		{
 			"ImportPath": "github.com/bkaradzic/go-lz4",
-			"Rev": "4f7c2045dbd17b802370e2e6022200468abf02ba"
+			"Rev": "74ddf82598bc4745b965729e9c6a463bedd33049"
 		},
 		{
 			"ImportPath": "github.com/calmh/du",
 			"Rev": "3c0690cca16228b97741327b1b6781397afbdb24"
-		},
-		{
-			"ImportPath": "github.com/calmh/logger",
-			"Rev": "c96f6a1a8c7b6bf2f4860c667867d90174799eb2"
 		},
 		{
 			"ImportPath": "github.com/calmh/luhn",
@@ -23,11 +19,11 @@
 		},
 		{
 			"ImportPath": "github.com/calmh/xdr",
-			"Rev": "5f7208e86762911861c94f1849eddbfc0a60cbf0"
+			"Rev": "47c0042d09a827b81ee62497f99e5e0c7f0bd31c"
 		},
 		{
 			"ImportPath": "github.com/golang/snappy",
-			"Rev": "0c7f8a7704bfec561913f4df52c832f094ef56f0"
+			"Rev": "723cc1e459b8eea2dea4583200fd60757d40097a"
 		},
 		{
 			"ImportPath": "github.com/juju/ratelimit",
@@ -38,16 +34,13 @@
 			"Rev": "6e7f843663477789fac7c02def0d0909e969b4e5"
 		},
 		{
-			"ImportPath": "github.com/syncthing/protocol",
-			"Rev": "ebcdea63c07327a342f65415bbadc497462b8f1f"
-		},
-		{
 			"ImportPath": "github.com/syndtr/goleveldb/leveldb",
-			"Rev": "183614d6b32571e867df4cf086f5480ceefbdfac"
+			"Rev": "1a9d62f03ea92815b46fcaab357cfd4df264b1a0"
 		},
 		{
 			"ImportPath": "github.com/thejerf/suture",
-			"Rev": "fc7aaeabdc43fe41c5328efa1479ffea0b820978"
+			"Comment": "v1.0.1",
+			"Rev": "99c1f2d613756768fc4299acd9dc621e11ed3fd7"
 		},
 		{
 			"ImportPath": "github.com/vitrun/qart/coding",
@@ -63,19 +56,31 @@
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/bcrypt",
-			"Rev": "7d5b0be716b9d6d4269afdaae10032bb296d3cdf"
+			"Rev": "81bf7719a6b7ce9b665598222362b50122dfc13b"
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/blowfish",
-			"Rev": "7d5b0be716b9d6d4269afdaae10032bb296d3cdf"
+			"Rev": "81bf7719a6b7ce9b665598222362b50122dfc13b"
+		},
+		{
+			"ImportPath": "golang.org/x/net/internal/iana",
+			"Rev": "4b709d93778b93d2f34943e3142c71578d83ad31"
+		},
+		{
+			"ImportPath": "golang.org/x/net/ipv6",
+			"Rev": "4b709d93778b93d2f34943e3142c71578d83ad31"
+		},
+		{
+			"ImportPath": "golang.org/x/net/proxy",
+			"Rev": "4b709d93778b93d2f34943e3142c71578d83ad31"
 		},
 		{
 			"ImportPath": "golang.org/x/text/transform",
-			"Rev": "3eb7007b740b66a77f3c85f2660a0240b284115a"
+			"Rev": "723492b65e225eafcba054e76ba18bb9c5ac1ea2"
 		},
 		{
 			"ImportPath": "golang.org/x/text/unicode/norm",
-			"Rev": "3eb7007b740b66a77f3c85f2660a0240b284115a"
+			"Rev": "723492b65e225eafcba054e76ba18bb9c5ac1ea2"
 		}
 	]
 }

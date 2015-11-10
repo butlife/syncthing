@@ -9,10 +9,7 @@ package stats
 import (
 	"time"
 
-	"github.com/syncthing/protocol"
-
 	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 type FolderStatistics struct {
@@ -30,7 +27,7 @@ type LastFile struct {
 	Deleted  bool      `json:"deleted"`
 }
 
-func NewFolderStatisticsReference(ldb *leveldb.DB, folder string) *FolderStatisticsReference {
+func NewFolderStatisticsReference(ldb *db.Instance, folder string) *FolderStatisticsReference {
 	prefix := string(db.KeyTypeFolderStatistic) + folder
 	return &FolderStatisticsReference{
 		ns:     db.NewNamespacedKV(ldb, prefix),
@@ -55,13 +52,11 @@ func (s *FolderStatisticsReference) GetLastFile() LastFile {
 	}
 }
 
-func (s *FolderStatisticsReference) ReceivedFile(file protocol.FileInfo) {
-	if debug {
-		l.Debugln("stats.FolderStatisticsReference.ReceivedFile:", s.folder, file)
-	}
+func (s *FolderStatisticsReference) ReceivedFile(file string, deleted bool) {
+	l.Debugln("stats.FolderStatisticsReference.ReceivedFile:", s.folder, file)
 	s.ns.PutTime("lastFileAt", time.Now())
-	s.ns.PutString("lastFileName", file.Name)
-	s.ns.PutBool("lastFileDeleted", file.IsDeleted())
+	s.ns.PutString("lastFileName", file)
+	s.ns.PutBool("lastFileDeleted", deleted)
 }
 
 func (s *FolderStatisticsReference) GetStatistics() FolderStatistics {

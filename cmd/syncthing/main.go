@@ -7,7 +7,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -21,30 +23,32 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/calmh/logger"
-	"github.com/juju/ratelimit"
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/logger"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/relay"
 	"github.com/syncthing/syncthing/lib/symlinks"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/opt"
+
 	"github.com/thejerf/suture"
-	"golang.org/x/crypto/bcrypt"
 )
 
 var (
 	Version     = "unknown-dev"
+	Codename    = "Beryllium Bedbug"
 	BuildEnv    = "default"
 	BuildStamp  = "0"
 	BuildDate   time.Time
@@ -64,11 +68,21 @@ const (
 )
 
 const (
-	bepProtocolName   = "bep/1.0"
-	pingEventInterval = time.Minute
+	bepProtocolName      = "bep/1.0"
+	tlsDefaultCommonName = "syncthing"
+	tlsRSABits           = 3072
+	pingEventInterval    = time.Minute
+	maxSystemErrors      = 5
+	initialSystemLog     = 10
+	maxSystemLog         = 250
 )
 
-var l = logger.DefaultLogger
+// The discovery results are sorted by their source priority.
+const (
+	ipv6LocalDiscoveryPriority = iota
+	ipv4LocalDiscoveryPriority
+	globalDiscoveryPriority
+)
 
 func init() {
 	if Version != "unknown-dev" {
@@ -93,7 +107,7 @@ func init() {
 	BuildDate = time.Unix(int64(stamp), 0)
 
 	date := BuildDate.UTC().Format("2006-01-02 15:04:05 MST")
-	LongVersion = fmt.Sprintf("syncthing %s (%s %s-%s %s) %s@%s %s", Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildEnv, BuildUser, BuildHost, date)
+	LongVersion = fmt.Sprintf(`syncthing %s "%s" (%s %s-%s %s) %s@%s %s`, Version, Codename, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildEnv, BuildUser, BuildHost, date)
 
 	if os.Getenv("STTRACE") != "" {
 		logFlags = log.Ltime | log.Ldate | log.Lmicroseconds | log.Lshortfile
@@ -101,16 +115,12 @@ func init() {
 }
 
 var (
-	cfg            *config.Wrapper
-	myID           protocol.DeviceID
-	confDir        string
-	logFlags       = log.Ltime
-	writeRateLimit *ratelimit.Bucket
-	readRateLimit  *ratelimit.Bucket
-	stop           = make(chan int)
-	discoverer     *discover.Discoverer
-	cert           tls.Certificate
-	lans           []*net.IPNet
+	myID     protocol.DeviceID
+	confDir  string
+	logFlags = log.Ltime
+	stop     = make(chan int)
+	cert     tls.Certificate
+	lans     []*net.IPNet
 )
 
 const (
@@ -140,25 +150,11 @@ Development Settings
 The following environment variables modify syncthing's behavior in ways that
 are mostly useful for developers. Use with care.
 
- STGUIASSETS     Directory to load GUI assets from. Overrides compiled in assets.
+ STGUIASSETS     Directory to load GUI assets from. Overrides compiled in
+                 assets.
 
  STTRACE         A comma separated string of facilities to trace. The valid
-                 facility strings are:
-
-                 - "beacon"   (the beacon package)
-                 - "discover" (the discover package)
-                 - "events"   (the events package)
-                 - "files"    (the files package)
-                 - "http"     (the main package; HTTP requests)
-                 - "locks"    (the sync package; trace long held locks)
-                 - "net"      (the main package; connections & network messages)
-                 - "model"    (the model package)
-                 - "scanner"  (the scanner package)
-                 - "stats"    (the stats package)
-                 - "suture"   (the suture package; service management)
-                 - "upnp"     (the upnp package)
-                 - "xdr"      (the xdr package)
-                 - "all"      (all of the above)
+                 facility strings listed below.
 
  STPROFILER      Set to a listen address such as "127.0.0.1:9090" to start the
                  profiler with HTTP access.
@@ -181,48 +177,55 @@ are mostly useful for developers. Use with care.
 
  GOGC            Percentage of heap growth at which to trigger GC. Default is
                  100. Lower numbers keep peak memory usage down, at the price
-                 of CPU usage (ie. performance).`
+                 of CPU usage (ie. performance).
+
+
+Debugging Facilities
+--------------------
+
+The following are valid values for the STTRACE variable:
+
+%s`
 )
 
 // Command line and environment options
 var (
-	reset             bool
-	showVersion       bool
-	doUpgrade         bool
-	doUpgradeCheck    bool
-	upgradeTo         string
-	noBrowser         bool
-	noConsole         bool
-	generateDir       string
-	logFile           string
-	auditEnabled      bool
-	verbose           bool
-	noRestart         = os.Getenv("STNORESTART") != ""
-	noUpgrade         = os.Getenv("STNOUPGRADE") != ""
-	guiAddress        = os.Getenv("STGUIADDRESS") // legacy
-	guiAuthentication = os.Getenv("STGUIAUTH")    // legacy
-	guiAPIKey         = os.Getenv("STGUIAPIKEY")  // legacy
-	profiler          = os.Getenv("STPROFILER")
-	guiAssets         = os.Getenv("STGUIASSETS")
-	cpuProfile        = os.Getenv("STCPUPROFILE") != ""
-	stRestarting      = os.Getenv("STRESTART") != ""
-	innerProcess      = os.Getenv("STNORESTART") != "" || os.Getenv("STMONITORED") != ""
+	reset          bool
+	showVersion    bool
+	doUpgrade      bool
+	doUpgradeCheck bool
+	upgradeTo      string
+	noBrowser      bool
+	noConsole      bool
+	generateDir    string
+	logFile        string
+	auditEnabled   bool
+	verbose        bool
+	paused         bool
+	noRestart      = os.Getenv("STNORESTART") != ""
+	noUpgrade      = os.Getenv("STNOUPGRADE") != ""
+	profiler       = os.Getenv("STPROFILER")
+	guiAssets      = os.Getenv("STGUIASSETS")
+	cpuProfile     = os.Getenv("STCPUPROFILE") != ""
+	stRestarting   = os.Getenv("STRESTART") != ""
+	innerProcess   = os.Getenv("STNORESTART") != "" || os.Getenv("STMONITORED") != ""
 )
 
 func main() {
 	if runtime.GOOS == "windows" {
 		// On Windows, we use a log file by default. Setting the -logfile flag
 		// to "-" disables this behavior.
-
 		flag.StringVar(&logFile, "logfile", "", "Log file name (use \"-\" for stdout)")
 
 		// We also add an option to hide the console window
 		flag.BoolVar(&noConsole, "no-console", false, "Hide console window")
+	} else {
+		flag.StringVar(&logFile, "logfile", "-", "Log file name (use \"-\" for stdout)")
 	}
 
+	var guiAddress, guiAPIKey string
 	flag.StringVar(&generateDir, "generate", "", "Generate key and config in specified dir, then exit")
 	flag.StringVar(&guiAddress, "gui-address", guiAddress, "Override GUI address")
-	flag.StringVar(&guiAuthentication, "gui-authentication", guiAuthentication, "Override GUI authentication; username:password")
 	flag.StringVar(&guiAPIKey, "gui-apikey", guiAPIKey, "Override GUI API key")
 	flag.StringVar(&confDir, "home", "", "Set configuration directory")
 	flag.IntVar(&logFlags, "logflags", logFlags, "Select information in log line prefix")
@@ -235,9 +238,20 @@ func main() {
 	flag.StringVar(&upgradeTo, "upgrade-to", upgradeTo, "Force upgrade directly from specified URL")
 	flag.BoolVar(&auditEnabled, "audit", false, "Write events to audit file")
 	flag.BoolVar(&verbose, "verbose", false, "Print verbose log output")
+	flag.BoolVar(&paused, "paused", false, "Start with all devices paused")
 
-	flag.Usage = usageFor(flag.CommandLine, usage, fmt.Sprintf(extraUsage, baseDirs["config"]))
+	longUsage := fmt.Sprintf(extraUsage, baseDirs["config"], debugFacilities())
+	flag.Usage = usageFor(flag.CommandLine, usage, longUsage)
 	flag.Parse()
+
+	if guiAddress != "" {
+		// The config picks this up from the environment.
+		os.Setenv("STGUIADDRESS", guiAddress)
+	}
+	if guiAPIKey != "" {
+		// The config picks this up from the environment.
+		os.Setenv("STGUIAPIKEY", guiAPIKey)
+	}
 
 	if noConsole {
 		osutil.HideConsole()
@@ -256,14 +270,9 @@ func main() {
 		guiAssets = locations[locGUIAssets]
 	}
 
-	if runtime.GOOS == "windows" {
-		if logFile == "" {
-			// Use the default log file location
-			logFile = locations[locLogFile]
-		} else if logFile == "-" {
-			// Don't use a logFile
-			logFile = ""
-		}
+	if logFile == "" {
+		// Use the default log file location
+		logFile = locations[locLogFile]
 	}
 
 	if showVersion {
@@ -296,10 +305,13 @@ func main() {
 			l.Warnln("Key exists; will not overwrite.")
 			l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
 		} else {
-			cert, err = newCertificate(certFile, keyFile, tlsDefaultCommonName)
+			cert, err = tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, tlsRSABits)
+			if err != nil {
+				l.Fatalln("Create certificate:", err)
+			}
 			myID = protocol.NewDeviceID(cert.Certificate[0])
 			if err != nil {
-				l.Fatalln("load cert:", err)
+				l.Fatalln("Load certificate:", err)
 			}
 			if err == nil {
 				l.Infoln("Device ID:", protocol.NewDeviceID(cert.Certificate[0]))
@@ -339,7 +351,11 @@ func main() {
 	}
 
 	if doUpgrade || doUpgradeCheck {
-		rel, err := upgrade.LatestRelease(Version)
+		releasesURL := "https://api.github.com/repos/syncthing/syncthing/releases?per_page=30"
+		if cfg, _, err := loadConfig(locations[locConfigFile]); err == nil {
+			releasesURL = cfg.Options().ReleasesURL
+		}
+		rel, err := upgrade.LatestRelease(releasesURL, Version)
 		if err != nil {
 			l.Fatalln("Upgrade:", err) // exits 1
 		}
@@ -353,7 +369,7 @@ func main() {
 
 		if doUpgrade {
 			// Use leveldb database locks to protect against concurrent upgrades
-			_, err = leveldb.OpenFile(locations[locDatabase], &opt.Options{OpenFilesCacheCapacity: 100})
+			_, err = db.Open(locations[locDatabase])
 			if err != nil {
 				l.Infoln("Attempting upgrade through running Syncthing...")
 				err = upgradeViaRest()
@@ -386,21 +402,40 @@ func main() {
 	}
 }
 
+func debugFacilities() string {
+	facilities := l.Facilities()
+
+	// Get a sorted list of names
+	var names []string
+	maxLen := 0
+	for name := range facilities {
+		names = append(names, name)
+		if len(name) > maxLen {
+			maxLen = len(name)
+		}
+	}
+	sort.Strings(names)
+
+	// Format the choices
+	b := new(bytes.Buffer)
+	for _, name := range names {
+		fmt.Fprintf(b, " %-*s - %s\n", maxLen, name, facilities[name])
+	}
+	return b.String()
+}
+
 func upgradeViaRest() error {
 	cfg, err := config.Load(locations[locConfigFile], protocol.LocalDeviceID)
 	if err != nil {
 		return err
 	}
-	target := cfg.GUI().Address
-	if cfg.GUI().UseTLS {
-		target = "https://" + target
-	} else {
-		target = "http://" + target
-	}
+	target := cfg.GUI().URL()
 	r, _ := http.NewRequest("POST", target+"/rest/system/upgrade", nil)
-	r.Header.Set("X-API-Key", cfg.GUI().APIKey)
+	r.Header.Set("X-API-Key", cfg.GUI().APIKey())
 
 	tr := &http.Transport{
+		Dial:            dialer.Dial,
+		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	client := &http.Client{
@@ -428,9 +463,7 @@ func syncthingMain() {
 	// We want any logging it does to go through our log system.
 	mainSvc := suture.New("main", suture.Spec{
 		Log: func(line string) {
-			if debugSuture {
-				l.Debugln(line)
-			}
+			l.Debugln(line)
 		},
 	})
 	mainSvc.ServeBackground()
@@ -447,6 +480,9 @@ func syncthingMain() {
 		mainSvc.Add(newVerboseSvc())
 	}
 
+	errors := logger.NewRecorder(l, logger.LevelWarn, maxSystemErrors, 0)
+	systemLog := logger.NewRecorder(l, logger.LevelDebug, maxSystemLog, initialSystemLog)
+
 	// Event subscription for the API; must start early to catch the early events.
 	apiSub := events.NewBufferedSubscription(events.Default.Subscribe(events.AllEvents), 1000)
 
@@ -454,12 +490,18 @@ func syncthingMain() {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
+	// Attempt to increase the limit on number of open files to the maximum
+	// allowed, in case we have many peers. We don't really care enough to
+	// report the error if there is one.
+	osutil.MaximizeOpenFileLimit()
+
 	// Ensure that that we have a certificate and key.
 	cert, err := tls.LoadX509KeyPair(locations[locCertFile], locations[locKeyFile])
 	if err != nil {
-		cert, err = newCertificate(locations[locCertFile], locations[locKeyFile], tlsDefaultCommonName)
+		l.Infof("Generating RSA key and certificate for %s...", tlsDefaultCommonName)
+		cert, err = tlsutil.NewCertificate(locations[locCertFile], locations[locKeyFile], tlsDefaultCommonName, tlsRSABits)
 		if err != nil {
-			l.Fatalln("load cert:", err)
+			l.Fatalln(err)
 		}
 	}
 
@@ -472,6 +514,7 @@ func syncthingMain() {
 
 	l.Infoln(LongVersion)
 	l.Infoln("My ID:", myID)
+	printHashRate()
 
 	// Emit the Starting event, now that we know who we are.
 
@@ -484,33 +527,21 @@ func syncthingMain() {
 
 	cfgFile := locations[locConfigFile]
 
-	var myName string
-
 	// Load the configuration file, if it exists.
 	// If it does not, create a template.
 
-	if info, err := os.Stat(cfgFile); err == nil {
-		if !info.Mode().IsRegular() {
-			l.Fatalln("Config file is not a file?")
-		}
-		cfg, err = config.Load(cfgFile, myID)
-		if err == nil {
-			myCfg := cfg.Devices()[myID]
-			if myCfg.Name == "" {
-				myName, _ = os.Hostname()
-			} else {
-				myName = myCfg.Name
-			}
+	cfg, myName, err := loadConfig(cfgFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			l.Infoln("No config file; starting with empty defaults")
+			myName, _ = os.Hostname()
+			newCfg := defaultConfig(myName)
+			cfg = config.Wrap(cfgFile, newCfg)
+			cfg.Save()
+			l.Infof("Edit %s to taste or use the GUI\n", cfgFile)
 		} else {
-			l.Fatalln("Configuration:", err)
+			l.Fatalln("Loading config:", err)
 		}
-	} else {
-		l.Infoln("No config file; starting with empty defaults")
-		myName, _ = os.Hostname()
-		newCfg := defaultConfig(myName)
-		cfg = config.Wrap(cfgFile, newCfg)
-		cfg.Save()
-		l.Infof("Edit %s to taste or use the GUI\n", cfgFile)
 	}
 
 	if cfg.Raw().OriginalVersion != config.CurrentVersion {
@@ -565,44 +596,47 @@ func syncthingMain() {
 		symlinks.Supported = false
 	}
 
-	protocol.PingTimeout = time.Duration(opts.PingTimeoutS) * time.Second
-	protocol.PingIdleTime = time.Duration(opts.PingIdleTimeS) * time.Second
-
-	if opts.MaxSendKbps > 0 {
-		writeRateLimit = ratelimit.NewBucketWithRate(float64(1000*opts.MaxSendKbps), int64(5*1000*opts.MaxSendKbps))
-	}
-	if opts.MaxRecvKbps > 0 {
-		readRateLimit = ratelimit.NewBucketWithRate(float64(1000*opts.MaxRecvKbps), int64(5*1000*opts.MaxRecvKbps))
-	}
-
 	if (opts.MaxRecvKbps > 0 || opts.MaxSendKbps > 0) && !opts.LimitBandwidthInLan {
 		lans, _ = osutil.GetLans()
-		networks := make([]string, 0, len(lans))
-		for _, lan := range lans {
-			networks = append(networks, lan.String())
+		for _, lan := range opts.AlwaysLocalNets {
+			_, ipnet, err := net.ParseCIDR(lan)
+			if err != nil {
+				l.Infoln("Network", lan, "is malformed:", err)
+				continue
+			}
+			lans = append(lans, ipnet)
+		}
+
+		networks := make([]string, len(lans))
+		for i, lan := range lans {
+			networks[i] = lan.String()
 		}
 		l.Infoln("Local networks:", strings.Join(networks, ", "))
 	}
 
 	dbFile := locations[locDatabase]
-	ldb, err := leveldb.OpenFile(dbFile, dbOpts())
-	if err != nil && errors.IsCorrupted(err) {
-		ldb, err = leveldb.RecoverFile(dbFile, dbOpts())
-	}
+	ldb, err := db.Open(dbFile)
 	if err != nil {
 		l.Fatalln("Cannot open database:", err, "- Is another copy of Syncthing already running?")
 	}
 
+	protectedFiles := []string{
+		locations[locDatabase],
+		locations[locConfigFile],
+		locations[locCertFile],
+		locations[locKeyFile],
+	}
+
 	// Remove database entries for folders that no longer exist in the config
 	folders := cfg.Folders()
-	for _, folder := range db.ListFolders(ldb) {
+	for _, folder := range ldb.ListFolders() {
 		if _, ok := folders[folder]; !ok {
 			l.Infof("Cleaning data for dropped folder %q", folder)
 			db.DropFolder(ldb, folder)
 		}
 	}
 
-	m := model.NewModel(cfg, myID, myName, "syncthing", Version, ldb)
+	m := model.NewModel(cfg, myID, myName, "syncthing", Version, ldb, protectedFiles)
 	cfg.Subscribe(m)
 
 	if t := os.Getenv("STDEADLOCKTIMEOUT"); len(t) > 0 {
@@ -611,7 +645,13 @@ func syncthingMain() {
 			m.StartDeadlockDetector(time.Duration(it) * time.Second)
 		}
 	} else if !IsRelease || IsBeta {
-		m.StartDeadlockDetector(20 * 60 * time.Second)
+		m.StartDeadlockDetector(20 * time.Minute)
+	}
+
+	if paused {
+		for device := range cfg.Devices() {
+			m.PauseDevice(device)
+		}
 	}
 
 	// Clear out old indexes for other devices. Otherwise we'll start up and
@@ -636,32 +676,88 @@ func syncthingMain() {
 
 	mainSvc.Add(m)
 
-	// GUI
-
-	setupGUI(mainSvc, cfg, m, apiSub)
-
 	// The default port we announce, possibly modified by setupUPnP next.
 
-	addr, err := net.ResolveTCPAddr("tcp", opts.ListenAddress[0])
+	uri, err := url.Parse(opts.ListenAddress[0])
+	if err != nil {
+		l.Fatalf("Failed to parse listen address %s: %v", opts.ListenAddress[0], err)
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", uri.Host)
 	if err != nil {
 		l.Fatalln("Bad listen address:", err)
 	}
 
-	// Start discovery
+	// The externalAddr tracks our external addresses for discovery purposes.
 
-	localPort := addr.Port
-	discoverer = discovery(localPort)
+	var addrList *addressLister
 
-	// Start UPnP. The UPnP service will restart global discovery if the
-	// external port changes.
+	// Start UPnP
 
 	if opts.UPnPEnabled {
-		upnpSvc := newUPnPSvc(cfg, localPort)
+		upnpSvc := newUPnPSvc(cfg, addr.Port)
 		mainSvc.Add(upnpSvc)
+
+		// The external address tracker needs to know about the UPnP service
+		// so it can check for an external mapped port.
+		addrList = newAddressLister(upnpSvc, cfg)
+	} else {
+		addrList = newAddressLister(nil, cfg)
 	}
 
-	connectionSvc := newConnectionSvc(cfg, myID, m, tlsCfg)
-	cfg.Subscribe(connectionSvc)
+	// Start relay management
+
+	var relaySvc *relay.Svc
+	if opts.RelaysEnabled && (opts.GlobalAnnEnabled || opts.RelayWithoutGlobalAnn) {
+		relaySvc = relay.NewSvc(cfg, tlsCfg)
+		mainSvc.Add(relaySvc)
+	}
+
+	// Start discovery
+
+	cachedDiscovery := discover.NewCachingMux()
+	mainSvc.Add(cachedDiscovery)
+
+	if cfg.Options().GlobalAnnEnabled {
+		for _, srv := range cfg.GlobalDiscoveryServers() {
+			l.Infoln("Using discovery server", srv)
+			gd, err := discover.NewGlobal(srv, cert, addrList, relaySvc)
+			if err != nil {
+				l.Warnln("Global discovery:", err)
+				continue
+			}
+
+			// Each global discovery server gets its results cached for five
+			// minutes, and is not asked again for a minute when it's returned
+			// unsuccessfully.
+			cachedDiscovery.Add(gd, 5*time.Minute, time.Minute, globalDiscoveryPriority)
+		}
+	}
+
+	if cfg.Options().LocalAnnEnabled {
+		// v4 broadcasts
+		bcd, err := discover.NewLocal(myID, fmt.Sprintf(":%d", cfg.Options().LocalAnnPort), addrList, relaySvc)
+		if err != nil {
+			l.Warnln("IPv4 local discovery:", err)
+		} else {
+			cachedDiscovery.Add(bcd, 0, 0, ipv4LocalDiscoveryPriority)
+		}
+		// v6 multicasts
+		mcd, err := discover.NewLocal(myID, cfg.Options().LocalAnnMCAddr, addrList, relaySvc)
+		if err != nil {
+			l.Warnln("IPv6 local discovery:", err)
+		} else {
+			cachedDiscovery.Add(mcd, 0, 0, ipv6LocalDiscoveryPriority)
+		}
+	}
+
+	// GUI
+
+	setupGUI(mainSvc, cfg, m, apiSub, cachedDiscovery, relaySvc, errors, systemLog)
+
+	// Start connection management
+
+	connectionSvc := connections.NewConnectionSvc(cfg, myID, m, tlsCfg, cachedDiscovery, relaySvc, bepProtocolName, tlsDefaultCommonName, lans)
 	mainSvc.Add(connectionSvc)
 
 	if cpuProfile {
@@ -697,7 +793,7 @@ func syncthingMain() {
 	// The usageReportingManager registers itself to listen to configuration
 	// changes, and there's nothing more we need to tell it from the outside.
 	// Hence we don't keep the returned pointer.
-	newUsageReportingManager(m, cfg)
+	newUsageReportingManager(cfg, m)
 
 	if opts.RestartOnWakeup {
 		go standbyMonitor()
@@ -707,7 +803,7 @@ func syncthingMain() {
 		if noUpgrade {
 			l.Infof("No automatic upgrades; STNOUPGRADE environment variable defined.")
 		} else if IsRelease {
-			go autoUpgrade()
+			go autoUpgrade(cfg)
 		} else {
 			l.Infof("No automatic upgrades; %s is not a release version.", Version)
 		}
@@ -733,38 +829,43 @@ func syncthingMain() {
 	os.Exit(code)
 }
 
-func dbOpts() *opt.Options {
-	// Calculate a suitable database block cache capacity.
+// printHashRate prints the hashing performance in MB/s, formatting it with
+// appropriate precision for the value, i.e. 182 MB/s, 18 MB/s, 1.8 MB/s, 0.18
+// MB/s.
+func printHashRate() {
+	hashRate := cpuBench(3, 100*time.Millisecond)
 
-	// Default is 8 MiB.
-	blockCacheCapacity := 8 << 20
-	// Increase block cache up to this maximum:
-	const maxCapacity = 64 << 20
-	// ... which we reach when the box has this much RAM:
-	const maxAtRAM = 8 << 30
-
-	if v := cfg.Options().DatabaseBlockCacheMiB; v != 0 {
-		// Use the value from the config, if it's set.
-		blockCacheCapacity = v << 20
-	} else if bytes, err := memorySize(); err == nil {
-		// We start at the default of 8 MiB and use larger values for machines
-		// with more memory.
-
-		if bytes > maxAtRAM {
-			// Cap the cache at maxCapacity when we reach maxAtRam amount of memory
-			blockCacheCapacity = maxCapacity
-		} else if bytes > maxAtRAM/maxCapacity*int64(blockCacheCapacity) {
-			// Grow from the default to maxCapacity at maxAtRam amount of memory
-			blockCacheCapacity = int(bytes * maxCapacity / maxAtRAM)
-		}
-		l.Infoln("Database block cache capacity", blockCacheCapacity/1024, "KiB")
+	decimals := 0
+	if hashRate < 1 {
+		decimals = 2
+	} else if hashRate < 10 {
+		decimals = 1
 	}
 
-	return &opt.Options{
-		OpenFilesCacheCapacity: 100,
-		BlockCacheCapacity:     blockCacheCapacity,
-		WriteBuffer:            4 << 20,
+	l.Infof("Single thread hash performance is ~%.*f MB/s", decimals, hashRate)
+}
+
+func loadConfig(cfgFile string) (*config.Wrapper, string, error) {
+	info, err := os.Stat(cfgFile)
+	if err != nil {
+		return nil, "", err
 	}
+	if !info.Mode().IsRegular() {
+		return nil, "", errors.New("configuration is not a file")
+	}
+
+	cfg, err := config.Load(cfgFile, myID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	myCfg := cfg.Devices()[myID]
+	myName := myCfg.Name
+	if myName == "" {
+		myName, _ = os.Hostname()
+	}
+
+	return cfg, myName, nil
 }
 
 func startAuditing(mainSvc *suture.Supervisor) {
@@ -784,82 +885,53 @@ func startAuditing(mainSvc *suture.Supervisor) {
 	l.Infoln("Audit log in", auditFile)
 }
 
-func setupGUI(mainSvc *suture.Supervisor, cfg *config.Wrapper, m *model.Model, apiSub *events.BufferedSubscription) {
-	opts := cfg.Options()
-	guiCfg := overrideGUIConfig(cfg.GUI(), guiAddress, guiAuthentication, guiAPIKey)
+func setupGUI(mainSvc *suture.Supervisor, cfg *config.Wrapper, m *model.Model, apiSub *events.BufferedSubscription, discoverer *discover.CachingMux, relaySvc *relay.Svc, errors, systemLog *logger.Recorder) {
+	guiCfg := cfg.GUI()
 
-	if guiCfg.Enabled && guiCfg.Address != "" {
-		addr, err := net.ResolveTCPAddr("tcp", guiCfg.Address)
-		if err != nil {
-			l.Fatalf("Cannot start GUI on %q: %v", guiCfg.Address, err)
-		} else {
-			var hostOpen, hostShow string
-			switch {
-			case addr.IP == nil:
-				hostOpen = "localhost"
-				hostShow = "0.0.0.0"
-			case addr.IP.IsUnspecified():
-				hostOpen = "localhost"
-				hostShow = addr.IP.String()
-			default:
-				hostOpen = addr.IP.String()
-				hostShow = hostOpen
-			}
+	if !guiCfg.Enabled {
+		return
+	}
 
-			var proto = "http"
-			if guiCfg.UseTLS {
-				proto = "https"
-			}
+	api, err := newAPISvc(myID, cfg, guiAssets, m, apiSub, discoverer, relaySvc, errors, systemLog)
+	if err != nil {
+		l.Fatalln("Cannot start GUI:", err)
+	}
+	cfg.Subscribe(api)
+	mainSvc.Add(api)
 
-			urlShow := fmt.Sprintf("%s://%s/", proto, net.JoinHostPort(hostShow, strconv.Itoa(addr.Port)))
-			l.Infoln("Starting web GUI on", urlShow)
-			api, err := newAPISvc(myID, guiCfg, guiAssets, m, apiSub)
-			if err != nil {
-				l.Fatalln("Cannot start GUI:", err)
-			}
-			cfg.Subscribe(api)
-			mainSvc.Add(api)
-
-			if opts.StartBrowser && !noBrowser && !stRestarting {
-				urlOpen := fmt.Sprintf("%s://%s/", proto, net.JoinHostPort(hostOpen, strconv.Itoa(addr.Port)))
-				// Can potentially block if the utility we are invoking doesn't
-				// fork, and just execs, hence keep it in it's own routine.
-				go openURL(urlOpen)
-			}
-		}
+	if cfg.Options().StartBrowser && !noBrowser && !stRestarting {
+		// Can potentially block if the utility we are invoking doesn't
+		// fork, and just execs, hence keep it in it's own routine.
+		go openURL(guiCfg.URL())
 	}
 }
 
 func defaultConfig(myName string) config.Configuration {
+	defaultFolder := config.NewFolderConfiguration("default", locations[locDefFolder])
+	defaultFolder.RescanIntervalS = 60
+	defaultFolder.MinDiskFreePct = 1
+	defaultFolder.Devices = []config.FolderDeviceConfiguration{{DeviceID: myID}}
+	defaultFolder.AutoNormalize = true
+	defaultFolder.MaxConflicts = -1
+
+	thisDevice := config.NewDeviceConfiguration(myID, myName)
+	thisDevice.Addresses = []string{"dynamic"}
+
 	newCfg := config.New(myID)
-	newCfg.Folders = []config.FolderConfiguration{
-		{
-			ID:              "default",
-			RawPath:         locations[locDefFolder],
-			RescanIntervalS: 60,
-			MinDiskFreePct:  1,
-			Devices:         []config.FolderDeviceConfiguration{{DeviceID: myID}},
-		},
-	}
-	newCfg.Devices = []config.DeviceConfiguration{
-		{
-			DeviceID:  myID,
-			Addresses: []string{"dynamic"},
-			Name:      myName,
-		},
-	}
+	newCfg.Folders = []config.FolderConfiguration{defaultFolder}
+	newCfg.Devices = []config.DeviceConfiguration{thisDevice}
 
 	port, err := getFreePort("127.0.0.1", 8384)
 	if err != nil {
 		l.Fatalln("get free port (GUI):", err)
 	}
-	newCfg.GUI.Address = fmt.Sprintf("127.0.0.1:%d", port)
+	newCfg.GUI.RawAddress = fmt.Sprintf("127.0.0.1:%d", port)
 
 	port, err = getFreePort("0.0.0.0", 22000)
 	if err != nil {
 		l.Fatalln("get free port (BEP):", err)
 	}
-	newCfg.Options.ListenAddress = []string{fmt.Sprintf("0.0.0.0:%d", port)}
+	newCfg.Options.ListenAddress = []string{fmt.Sprintf("tcp://0.0.0.0:%d", port)}
 	return newCfg
 }
 
@@ -882,23 +954,6 @@ func restart() {
 func shutdown() {
 	l.Infoln("Shutting down")
 	stop <- exitSuccess
-}
-
-func discovery(extPort int) *discover.Discoverer {
-	opts := cfg.Options()
-	disc := discover.NewDiscoverer(myID, opts.ListenAddress)
-
-	if opts.LocalAnnEnabled {
-		l.Infoln("Starting local discovery announcements")
-		disc.StartLocal(opts.LocalAnnPort, opts.LocalAnnMCAddr)
-	}
-
-	if opts.GlobalAnnEnabled {
-		l.Infoln("Starting global discovery announcements")
-		disc.StartGlobal(opts.GlobalAnnServers, uint16(extPort))
-	}
-
-	return disc
 }
 
 func ensureDir(dir string, mode int) {
@@ -938,48 +993,6 @@ func getFreePort(host string, ports ...int) (int, error) {
 	return addr.Port, nil
 }
 
-func overrideGUIConfig(cfg config.GUIConfiguration, address, authentication, apikey string) config.GUIConfiguration {
-	if address != "" {
-		cfg.Enabled = true
-
-		if !strings.Contains(address, "//") {
-			// Assume just an IP was given. Don't touch he TLS setting.
-			cfg.Address = address
-		} else {
-			parsed, err := url.Parse(address)
-			if err != nil {
-				l.Fatalln(err)
-			}
-			cfg.Address = parsed.Host
-			switch parsed.Scheme {
-			case "http":
-				cfg.UseTLS = false
-			case "https":
-				cfg.UseTLS = true
-			default:
-				l.Fatalln("Unknown scheme:", parsed.Scheme)
-			}
-		}
-	}
-
-	if authentication != "" {
-		authenticationParts := strings.SplitN(authentication, ":", 2)
-
-		hash, err := bcrypt.GenerateFromPassword([]byte(authenticationParts[1]), 0)
-		if err != nil {
-			l.Fatalln("Invalid GUI password:", err)
-		}
-
-		cfg.User = authenticationParts[0]
-		cfg.Password = string(hash)
-	}
-
-	if apikey != "" {
-		cfg.APIKey = apikey
-	}
-	return cfg
-}
-
 func standbyMonitor() {
 	restartDelay := time.Duration(60 * time.Second)
 	now := time.Now()
@@ -1000,7 +1013,7 @@ func standbyMonitor() {
 	}
 }
 
-func autoUpgrade() {
+func autoUpgrade(cfg *config.Wrapper) {
 	timer := time.NewTimer(0)
 	sub := events.Default.Subscribe(events.DeviceConnected)
 	for {
@@ -1014,7 +1027,7 @@ func autoUpgrade() {
 		case <-timer.C:
 		}
 
-		rel, err := upgrade.LatestRelease(Version)
+		rel, err := upgrade.LatestRelease(cfg.Options().ReleasesURL, Version)
 		if err == upgrade.ErrUpgradeUnsupported {
 			events.Default.Unsubscribe(sub)
 			return

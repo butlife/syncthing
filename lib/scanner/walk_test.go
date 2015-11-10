@@ -8,18 +8,22 @@ package scanner
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	rdebug "runtime/debug"
 	"sort"
+	"sync"
 	"testing"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/symlinks"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -149,13 +153,18 @@ func TestVerify(t *testing.T) {
 	// data should be an even multiple of blocksize long
 	data := []byte("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut e")
 	buf := bytes.NewBuffer(data)
+	var progress int64
 
-	blocks, err := Blocks(buf, blocksize, 0)
+	blocks, err := Blocks(buf, blocksize, 0, &progress)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if exp := len(data) / blocksize; len(blocks) != exp {
 		t.Fatalf("Incorrect number of blocks %d != %d", len(blocks), exp)
+	}
+
+	if int64(len(data)) != progress {
+		t.Fatalf("Incorrect counter value %d  != %d", len(data), progress)
 	}
 
 	buf = bytes.NewBuffer(data)
@@ -274,7 +283,7 @@ func TestNormalization(t *testing.T) {
 func TestIssue1507(t *testing.T) {
 	w := Walker{}
 	c := make(chan protocol.FileInfo, 100)
-	fn := w.walkAndHashFiles(c)
+	fn := w.walkAndHashFiles(c, c)
 
 	fn("", nil, protocol.ErrClosed)
 }
@@ -337,4 +346,68 @@ func (l testfileList) String() string {
 	}
 	b.WriteString("}")
 	return b.String()
+}
+
+func TestSymlinkTypeEqual(t *testing.T) {
+	testcases := []struct {
+		onDiskType   symlinks.TargetType
+		inIndexFlags uint32
+		equal        bool
+	}{
+		// File is only equal to file
+		{symlinks.TargetFile, 0, true},
+		{symlinks.TargetFile, protocol.FlagDirectory, false},
+		{symlinks.TargetFile, protocol.FlagSymlinkMissingTarget, false},
+		// Directory is only equal to directory
+		{symlinks.TargetDirectory, 0, false},
+		{symlinks.TargetDirectory, protocol.FlagDirectory, true},
+		{symlinks.TargetDirectory, protocol.FlagSymlinkMissingTarget, false},
+		// Unknown is equal to anything
+		{symlinks.TargetUnknown, 0, true},
+		{symlinks.TargetUnknown, protocol.FlagDirectory, true},
+		{symlinks.TargetUnknown, protocol.FlagSymlinkMissingTarget, true},
+	}
+
+	for _, tc := range testcases {
+		res := SymlinkTypeEqual(tc.onDiskType, protocol.FileInfo{Flags: tc.inIndexFlags})
+		if res != tc.equal {
+			t.Errorf("Incorrect result %v for %v, %v", res, tc.onDiskType, tc.inIndexFlags)
+		}
+	}
+}
+
+var initOnce sync.Once
+
+const (
+	testdataSize = 17 << 20
+	testdataName = "_random.data"
+)
+
+func BenchmarkHashFile(b *testing.B) {
+	initOnce.Do(initTestFile)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := HashFile(testdataName, protocol.BlockSize, testdataSize, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+}
+
+func initTestFile() {
+	fd, err := os.Create(testdataName)
+	if err != nil {
+		panic(err)
+	}
+
+	lr := io.LimitReader(rand.Reader, testdataSize)
+	if _, err := io.Copy(fd, lr); err != nil {
+		panic(err)
+	}
+
+	if err := fd.Close(); err != nil {
+		panic(err)
+	}
 }

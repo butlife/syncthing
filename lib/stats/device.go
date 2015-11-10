@@ -9,9 +9,7 @@ package stats
 import (
 	"time"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 type DeviceStatistics struct {
@@ -20,11 +18,11 @@ type DeviceStatistics struct {
 
 type DeviceStatisticsReference struct {
 	ns     *db.NamespacedKV
-	device protocol.DeviceID
+	device string
 }
 
-func NewDeviceStatisticsReference(ldb *leveldb.DB, device protocol.DeviceID) *DeviceStatisticsReference {
-	prefix := string(db.KeyTypeDeviceStatistic) + device.String()
+func NewDeviceStatisticsReference(ldb *db.Instance, device string) *DeviceStatisticsReference {
+	prefix := string(db.KeyTypeDeviceStatistic) + device
 	return &DeviceStatisticsReference{
 		ns:     db.NewNamespacedKV(ldb, prefix),
 		device: device,
@@ -38,16 +36,12 @@ func (s *DeviceStatisticsReference) GetLastSeen() time.Time {
 		// time.Time{} from s.ns
 		return time.Unix(0, 0)
 	}
-	if debug {
-		l.Debugln("stats.DeviceStatisticsReference.GetLastSeen:", s.device, t)
-	}
+	l.Debugln("stats.DeviceStatisticsReference.GetLastSeen:", s.device, t)
 	return t
 }
 
 func (s *DeviceStatisticsReference) WasSeen() {
-	if debug {
-		l.Debugln("stats.DeviceStatisticsReference.WasSeen:", s.device)
-	}
+	l.Debugln("stats.DeviceStatisticsReference.WasSeen:", s.device)
 	s.ns.PutTime("lastSeen", time.Now())
 }
 

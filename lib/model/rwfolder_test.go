@@ -12,12 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/syncthing/protocol"
+	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/sync"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 )
 
 func init() {
@@ -41,6 +39,8 @@ var blocks = []protocol.BlockInfo{
 	{Offset: 786432, Size: 0x20000, Hash: []uint8{0x32, 0x28, 0xcd, 0xf, 0x37, 0x21, 0xe5, 0xd4, 0x1e, 0x58, 0x87, 0x73, 0x8e, 0x36, 0xdf, 0xb2, 0x70, 0x78, 0x56, 0xc3, 0x42, 0xff, 0xf7, 0x8f, 0x37, 0x95, 0x0, 0x26, 0xa, 0xac, 0x54, 0x72}},
 	{Offset: 917504, Size: 0x20000, Hash: []uint8{0x96, 0x6b, 0x15, 0x6b, 0xc4, 0xf, 0x19, 0x18, 0xca, 0xbb, 0x5f, 0xd6, 0xbb, 0xa2, 0xc6, 0x2a, 0xac, 0xbb, 0x8a, 0xb9, 0xce, 0xec, 0x4c, 0xdb, 0x78, 0xec, 0x57, 0x5d, 0x33, 0xf9, 0x8e, 0xaf}},
 }
+
+var folders = []string{"default"}
 
 // Layout of the files: (indexes from the above array)
 // 12345678 - Required file
@@ -67,8 +67,8 @@ func TestHandleFile(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
 	m.updateLocals("default", []protocol.FileInfo{existingFile})
@@ -123,8 +123,8 @@ func TestHandleFileWithTemp(t *testing.T) {
 	requiredFile := existingFile
 	requiredFile.Blocks = blocks[1:]
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
 	m.updateLocals("default", []protocol.FileInfo{existingFile})
@@ -185,8 +185,8 @@ func TestCopierFinder(t *testing.T) {
 	requiredFile.Blocks = blocks[1:]
 	requiredFile.Name = "file2"
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 	// Update index
 	m.updateLocals("default", []protocol.FileInfo{existingFile})
@@ -197,7 +197,7 @@ func TestCopierFinder(t *testing.T) {
 
 	// Verify that the blocks we say exist on file, really exist in the db.
 	for _, idx := range []int{2, 3, 4, 7} {
-		if m.finder.Iterate(blocks[idx].Hash, iterFn) == false {
+		if m.finder.Iterate(folders, blocks[idx].Hash, iterFn) == false {
 			t.Error("Didn't find block")
 		}
 	}
@@ -241,7 +241,7 @@ func TestCopierFinder(t *testing.T) {
 	}
 
 	// Verify that the fetched blocks have actually been written to the temp file
-	blks, err := scanner.HashFile(tempFile, protocol.BlockSize)
+	blks, err := scanner.HashFile(tempFile, protocol.BlockSize, 0, nil)
 	if err != nil {
 		t.Log(err)
 	}
@@ -262,8 +262,8 @@ func TestCopierCleanup(t *testing.T) {
 		return true
 	}
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 
 	// Create a file
@@ -277,7 +277,7 @@ func TestCopierCleanup(t *testing.T) {
 	// Add file to index
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.finder.Iterate(folders, blocks[0].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -286,11 +286,11 @@ func TestCopierCleanup(t *testing.T) {
 	// Update index (removing old blocks)
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if m.finder.Iterate(folders, blocks[0].Hash, iterFn) {
 		t.Error("Unexpected block found")
 	}
 
-	if !m.finder.Iterate(blocks[1].Hash, iterFn) {
+	if !m.finder.Iterate(folders, blocks[1].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -299,11 +299,11 @@ func TestCopierCleanup(t *testing.T) {
 	// Update index (removing old blocks)
 	m.updateLocals("default", []protocol.FileInfo{file})
 
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.finder.Iterate(folders, blocks[0].Hash, iterFn) {
 		t.Error("Unexpected block found")
 	}
 
-	if m.finder.Iterate(blocks[1].Hash, iterFn) {
+	if m.finder.Iterate(folders, blocks[1].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 }
@@ -311,8 +311,8 @@ func TestCopierCleanup(t *testing.T) {
 // Make sure that the copier routine hashes the content when asked, and pulls
 // if it fails to find the block.
 func TestLastResortPulling(t *testing.T) {
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 
 	// Add a file to index (with the incorrect block representation, as content
@@ -334,7 +334,7 @@ func TestLastResortPulling(t *testing.T) {
 	}
 
 	// Check that that particular block is there
-	if !m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if !m.finder.Iterate(folders, blocks[0].Hash, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -361,11 +361,11 @@ func TestLastResortPulling(t *testing.T) {
 	<-pullChan
 
 	// Verify that it did fix the incorrect hash.
-	if m.finder.Iterate(blocks[0].Hash, iterFn) {
+	if m.finder.Iterate(folders, blocks[0].Hash, iterFn) {
 		t.Error("Found unexpected block")
 	}
 
-	if !m.finder.Iterate(scanner.SHA256OfNothing, iterFn) {
+	if !m.finder.Iterate(folders, scanner.SHA256OfNothing, iterFn) {
 		t.Error("Expected block not found")
 	}
 
@@ -385,9 +385,9 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 	}
 	defer os.Remove("testdata/" + defTempNamer.TempName("filex"))
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	db := db.OpenMemory()
 
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 
 	emitter := NewProgressEmitter(defaultConfig)
@@ -407,7 +407,7 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 	p.queue.Push("filex", 0, 0)
 	p.queue.Pop()
 
-	if len(p.queue.progress) != 1 {
+	if p.queue.lenProgress() != 1 {
 		t.Fatal("Expected file in progress")
 	}
 
@@ -435,7 +435,7 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 	case state := <-finisherBufferChan:
 		// At this point the file should still be registered with both the job
 		// queue, and the progress emitter. Verify this.
-		if len(p.progressEmitter.registry) != 1 || len(p.queue.progress) != 1 || len(p.queue.queued) != 0 {
+		if p.progressEmitter.lenRegistry() != 1 || p.queue.lenProgress() != 1 || p.queue.lenQueued() != 0 {
 			t.Fatal("Could not find file")
 		}
 
@@ -443,20 +443,23 @@ func TestDeregisterOnFailInCopy(t *testing.T) {
 		finisherChan <- state
 		time.Sleep(100 * time.Millisecond)
 
-		if state.fd != nil {
+		state.mut.Lock()
+		stateFd := state.fd
+		state.mut.Unlock()
+		if stateFd != nil {
 			t.Fatal("File not closed?")
 		}
 
-		if len(p.progressEmitter.registry) != 0 || len(p.queue.progress) != 0 || len(p.queue.queued) != 0 {
-			t.Fatal("Still registered", len(p.progressEmitter.registry), len(p.queue.progress), len(p.queue.queued))
+		if p.progressEmitter.lenRegistry() != 0 || p.queue.lenProgress() != 0 || p.queue.lenQueued() != 0 {
+			t.Fatal("Still registered", p.progressEmitter.lenRegistry(), p.queue.lenProgress(), p.queue.lenQueued())
 		}
 
 		// Doing it again should have no effect
 		finisherChan <- state
 		time.Sleep(100 * time.Millisecond)
 
-		if len(p.progressEmitter.registry) != 0 || len(p.queue.progress) != 0 || len(p.queue.queued) != 0 {
-			t.Fatal("Still registered")
+		if p.progressEmitter.lenRegistry() != 0 || p.queue.lenProgress() != 0 || p.queue.lenQueued() != 0 {
+			t.Fatal("Still registered", p.progressEmitter.lenRegistry(), p.queue.lenProgress(), p.queue.lenQueued())
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Didn't get anything to the finisher")
@@ -475,8 +478,8 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 	}
 	defer os.Remove("testdata/" + defTempNamer.TempName("filex"))
 
-	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db)
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 
 	emitter := NewProgressEmitter(defaultConfig)
@@ -496,7 +499,7 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 	p.queue.Push("filex", 0, 0)
 	p.queue.Pop()
 
-	if len(p.queue.progress) != 1 {
+	if p.queue.lenProgress() != 1 {
 		t.Fatal("Expected file in progress")
 	}
 
@@ -517,7 +520,7 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 	case state := <-finisherBufferChan:
 		// At this point the file should still be registered with both the job
 		// queue, and the progress emitter. Verify this.
-		if len(p.progressEmitter.registry) != 1 || len(p.queue.progress) != 1 || len(p.queue.queued) != 0 {
+		if p.progressEmitter.lenRegistry() != 1 || p.queue.lenProgress() != 1 || p.queue.lenQueued() != 0 {
 			t.Fatal("Could not find file")
 		}
 
@@ -525,20 +528,23 @@ func TestDeregisterOnFailInPull(t *testing.T) {
 		finisherChan <- state
 		time.Sleep(100 * time.Millisecond)
 
-		if state.fd != nil {
+		state.mut.Lock()
+		stateFd := state.fd
+		state.mut.Unlock()
+		if stateFd != nil {
 			t.Fatal("File not closed?")
 		}
 
-		if len(p.progressEmitter.registry) != 0 || len(p.queue.progress) != 0 || len(p.queue.queued) != 0 {
-			t.Fatal("Still registered", len(p.progressEmitter.registry), len(p.queue.progress), len(p.queue.queued))
+		if p.progressEmitter.lenRegistry() != 0 || p.queue.lenProgress() != 0 || p.queue.lenQueued() != 0 {
+			t.Fatal("Still registered", p.progressEmitter.lenRegistry(), p.queue.lenProgress(), p.queue.lenQueued())
 		}
 
 		// Doing it again should have no effect
 		finisherChan <- state
 		time.Sleep(100 * time.Millisecond)
 
-		if len(p.progressEmitter.registry) != 0 || len(p.queue.progress) != 0 || len(p.queue.queued) != 0 {
-			t.Fatal("Still registered")
+		if p.progressEmitter.lenRegistry() != 0 || p.queue.lenProgress() != 0 || p.queue.lenQueued() != 0 {
+			t.Fatal("Still registered", p.progressEmitter.lenRegistry(), p.queue.lenProgress(), p.queue.lenQueued())
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Didn't get anything to the finisher")

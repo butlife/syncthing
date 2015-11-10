@@ -12,13 +12,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syncthing/syncthing/lib/ignore"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/symlinks"
 	"golang.org/x/text/unicode/norm"
 )
@@ -39,6 +40,8 @@ func init() {
 }
 
 type Walker struct {
+	// Folder for which the walker has been created
+	Folder string
 	// Dir is the base directory for the walk
 	Dir string
 	// Limit walking to these paths within Dir, or no limit if Sub is empty
@@ -46,7 +49,7 @@ type Walker struct {
 	// BlockSize controls the size of the block used when hashing.
 	BlockSize int
 	// If Matcher is not nil, it is used to identify files to ignore which were specified by the user.
-	Matcher *ignore.Matcher
+	Matcher IgnoreMatcher
 	// If TempNamer is not nil, it is used to ignore temporary files when walking.
 	TempNamer TempNamer
 	// Number of hours to keep temporary files for
@@ -66,6 +69,9 @@ type Walker struct {
 	Hashers int
 	// Our vector clock id
 	ShortID uint64
+	// Optional progress tick interval which defines how often FolderScanProgress
+	// events are emitted. Negative number means disabled.
+	ProgressTickIntervalS int
 }
 
 type TempNamer interface {
@@ -80,24 +86,28 @@ type CurrentFiler interface {
 	CurrentFile(name string) (protocol.FileInfo, bool)
 }
 
+type IgnoreMatcher interface {
+	// Match returns true if the file should be ignored.
+	Match(filename string) bool
+}
+
 // Walk returns the list of files found in the local folder by scanning the
 // file system. Files are blockwise hashed.
 func (w *Walker) Walk() (chan protocol.FileInfo, error) {
-	if debug {
-		l.Debugln("Walk", w.Dir, w.Subs, w.BlockSize, w.Matcher)
-	}
+	l.Debugln("Walk", w.Dir, w.Subs, w.BlockSize, w.Matcher)
 
 	err := checkDir(w.Dir)
 	if err != nil {
 		return nil, err
 	}
 
-	files := make(chan protocol.FileInfo)
-	hashedFiles := make(chan protocol.FileInfo)
-	newParallelHasher(w.Dir, w.BlockSize, w.Hashers, hashedFiles, files)
+	toHashChan := make(chan protocol.FileInfo)
+	finishedChan := make(chan protocol.FileInfo)
 
+	// A routine which walks the filesystem tree, and sends files which have
+	// been modified to the counter routine.
 	go func() {
-		hashFiles := w.walkAndHashFiles(files)
+		hashFiles := w.walkAndHashFiles(toHashChan, finishedChan)
 		if len(w.Subs) == 0 {
 			filepath.Walk(w.Dir, hashFiles)
 		} else {
@@ -105,13 +115,74 @@ func (w *Walker) Walk() (chan protocol.FileInfo, error) {
 				filepath.Walk(filepath.Join(w.Dir, sub), hashFiles)
 			}
 		}
-		close(files)
+		close(toHashChan)
 	}()
 
-	return hashedFiles, nil
+	// We're not required to emit scan progress events, just kick off hashers,
+	// and feed inputs directly from the walker.
+	if w.ProgressTickIntervalS < 0 {
+		newParallelHasher(w.Dir, w.BlockSize, w.Hashers, finishedChan, toHashChan, nil, nil)
+		return finishedChan, nil
+	}
+
+	// Defaults to every 2 seconds.
+	if w.ProgressTickIntervalS == 0 {
+		w.ProgressTickIntervalS = 2
+	}
+
+	ticker := time.NewTicker(time.Duration(w.ProgressTickIntervalS) * time.Second)
+
+	// We need to emit progress events, hence we create a routine which buffers
+	// the list of files to be hashed, counts the total number of
+	// bytes to hash, and once no more files need to be hashed (chan gets closed),
+	// start a routine which periodically emits FolderScanProgress events,
+	// until a stop signal is sent by the parallel hasher.
+	// Parallel hasher is stopped by this routine when we close the channel over
+	// which it receives the files we ask it to hash.
+	go func() {
+		var filesToHash []protocol.FileInfo
+		var total, progress int64 = 1, 0
+		for file := range toHashChan {
+			filesToHash = append(filesToHash, file)
+			total += int64(file.CachedSize)
+		}
+
+		realToHashChan := make(chan protocol.FileInfo)
+		done := make(chan struct{})
+		newParallelHasher(w.Dir, w.BlockSize, w.Hashers, finishedChan, realToHashChan, &progress, done)
+
+		// A routine which actually emits the FolderScanProgress events
+		// every w.ProgressTicker ticks, until the hasher routines terminate.
+		go func() {
+			for {
+				select {
+				case <-done:
+					l.Debugln("Walk progress done", w.Dir, w.Subs, w.BlockSize, w.Matcher)
+					ticker.Stop()
+					return
+				case <-ticker.C:
+					current := atomic.LoadInt64(&progress)
+					l.Debugf("Walk %s %s current progress %d/%d (%d%%)", w.Dir, w.Subs, current, total, current*100/total)
+					events.Default.Log(events.FolderScanProgress, map[string]interface{}{
+						"folder":  w.Folder,
+						"current": current,
+						"total":   total,
+					})
+				}
+			}
+		}()
+
+		for _, file := range filesToHash {
+			l.Debugln("real to hash:", file.Name)
+			realToHashChan <- file
+		}
+		close(realToHashChan)
+	}()
+
+	return finishedChan, nil
 }
 
-func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFunc {
+func (w *Walker) walkAndHashFiles(fchan, dchan chan protocol.FileInfo) filepath.WalkFunc {
 	now := time.Now()
 	return func(p string, info os.FileInfo, err error) error {
 		// Return value used when we are returning early and don't want to
@@ -123,17 +194,13 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 		}
 
 		if err != nil {
-			if debug {
-				l.Debugln("error:", p, info, err)
-			}
+			l.Debugln("error:", p, info, err)
 			return skip
 		}
 
 		rn, err := filepath.Rel(w.Dir, p)
 		if err != nil {
-			if debug {
-				l.Debugln("rel error:", p, err)
-			}
+			l.Debugln("rel error:", p, err)
 			return skip
 		}
 
@@ -148,24 +215,18 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 
 		if w.TempNamer != nil && w.TempNamer.IsTemporary(rn) {
 			// A temporary file
-			if debug {
-				l.Debugln("temporary:", rn)
-			}
+			l.Debugln("temporary:", rn)
 			if info.Mode().IsRegular() && mtime.Add(w.TempLifetime).Before(now) {
 				os.Remove(p)
-				if debug {
-					l.Debugln("removing temporary:", rn, mtime)
-				}
+				l.Debugln("removing temporary:", rn, mtime)
 			}
 			return nil
 		}
 
 		if sn := filepath.Base(rn); sn == ".stignore" || sn == ".stfolder" ||
-			strings.HasPrefix(rn, ".stversions") || w.Matcher.Match(rn) {
+			strings.HasPrefix(rn, ".stversions") || (w.Matcher != nil && w.Matcher.Match(rn)) {
 			// An ignored file
-			if debug {
-				l.Debugln("ignored:", rn)
-			}
+			l.Debugln("ignored:", rn)
 			return skip
 		}
 
@@ -232,20 +293,15 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 			// checking that their existing blocks match with the blocks in
 			// the index.
 
-			target, flags, err := symlinks.Read(p)
-			flags = flags & protocol.SymlinkTypeMask
+			target, targetType, err := symlinks.Read(p)
 			if err != nil {
-				if debug {
-					l.Debugln("readlink error:", p, err)
-				}
+				l.Debugln("readlink error:", p, err)
 				return skip
 			}
 
-			blocks, err := Blocks(strings.NewReader(target), w.BlockSize, 0)
+			blocks, err := Blocks(strings.NewReader(target), w.BlockSize, 0, nil)
 			if err != nil {
-				if debug {
-					l.Debugln("hash link error:", p, err)
-				}
+				l.Debugln("hash link error:", p, err)
 				return skip
 			}
 
@@ -258,7 +314,7 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 				//  - the symlink type (file/dir) was the same
 				//  - the block list (i.e. hash of target) was the same
 				cf, ok = w.CurrentFiler.CurrentFile(rn)
-				if ok && !cf.IsDeleted() && cf.IsSymlink() && !cf.IsInvalid() && SymlinkTypeEqual(flags, cf.Flags) && BlocksEqual(cf.Blocks, blocks) {
+				if ok && !cf.IsDeleted() && cf.IsSymlink() && !cf.IsInvalid() && SymlinkTypeEqual(targetType, cf) && BlocksEqual(cf.Blocks, blocks) {
 					return skip
 				}
 			}
@@ -266,16 +322,14 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 			f := protocol.FileInfo{
 				Name:     rn,
 				Version:  cf.Version.Update(w.ShortID),
-				Flags:    protocol.FlagSymlink | flags | protocol.FlagNoPermBits | 0666,
+				Flags:    uint32(protocol.FlagSymlink | protocol.FlagNoPermBits | 0666 | SymlinkFlags(targetType)),
 				Modified: 0,
 				Blocks:   blocks,
 			}
 
-			if debug {
-				l.Debugln("symlink to hash:", p, f)
-			}
+			l.Debugln("symlink changedb:", p, f)
 
-			fchan <- f
+			dchan <- f
 
 			return skip
 		}
@@ -308,10 +362,8 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 				Flags:    flags,
 				Modified: mtime.Unix(),
 			}
-			if debug {
-				l.Debugln("dir:", p, f)
-			}
-			fchan <- f
+			l.Debugln("dir:", p, f)
+			dchan <- f
 			return nil
 		}
 
@@ -338,9 +390,7 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 					return nil
 				}
 
-				if debug {
-					l.Debugln("rescan:", cf, mtime.Unix(), info.Mode()&os.ModePerm)
-				}
+				l.Debugln("rescan:", cf, mtime.Unix(), info.Mode()&os.ModePerm)
 			}
 
 			var flags = curMode & uint32(maskModePerm)
@@ -349,14 +399,13 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 			}
 
 			f := protocol.FileInfo{
-				Name:     rn,
-				Version:  cf.Version.Update(w.ShortID),
-				Flags:    flags,
-				Modified: mtime.Unix(),
+				Name:       rn,
+				Version:    cf.Version.Update(w.ShortID),
+				Flags:      flags,
+				Modified:   mtime.Unix(),
+				CachedSize: info.Size(),
 			}
-			if debug {
-				l.Debugln("to hash:", p, f)
-			}
+			l.Debugln("to hash:", p, f)
 			fchan <- f
 		}
 
@@ -369,7 +418,7 @@ func checkDir(dir string) error {
 		return err
 	} else if !info.IsDir() {
 		return errors.New(dir + ": not a directory")
-	} else if debug {
+	} else {
 		l.Debugln("checkDir", dir, info)
 	}
 	return nil
@@ -387,7 +436,7 @@ func PermsEqual(a, b uint32) bool {
 	}
 }
 
-func SymlinkTypeEqual(disk, index uint32) bool {
+func SymlinkTypeEqual(disk symlinks.TargetType, f protocol.FileInfo) bool {
 	// If the target is missing, Unix never knows what type of symlink it is
 	// and Windows always knows even if there is no target. Which means that
 	// without this special check a Unix node would be fighting with a Windows
@@ -396,8 +445,25 @@ func SymlinkTypeEqual(disk, index uint32) bool {
 	// know means you are on Unix, and on Unix you don't really care what the
 	// target type is. The moment you do know, and if something doesn't match,
 	// that will propagate through the cluster.
-	if disk&protocol.FlagSymlinkMissingTarget != 0 && index&protocol.FlagSymlinkMissingTarget == 0 {
+	switch disk {
+	case symlinks.TargetUnknown:
 		return true
+	case symlinks.TargetDirectory:
+		return f.IsDirectory() && f.Flags&protocol.FlagSymlinkMissingTarget == 0
+	case symlinks.TargetFile:
+		return !f.IsDirectory() && f.Flags&protocol.FlagSymlinkMissingTarget == 0
 	}
-	return disk&protocol.SymlinkTypeMask == index&protocol.SymlinkTypeMask
+	panic("unknown symlink TargetType")
+}
+
+func SymlinkFlags(t symlinks.TargetType) uint32 {
+	switch t {
+	case symlinks.TargetFile:
+		return 0
+	case symlinks.TargetDirectory:
+		return protocol.FlagDirectory
+	case symlinks.TargetUnknown:
+		return protocol.FlagSymlinkMissingTarget
+	}
+	panic("unknown symlink TargetType")
 }

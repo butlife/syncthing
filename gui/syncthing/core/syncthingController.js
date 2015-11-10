@@ -48,6 +48,7 @@ angular.module('syncthing.core')
         $scope.failedCurrentPage = 1;
         $scope.failedCurrentFolder = undefined;
         $scope.failedPageSize = 10;
+        $scope.scanProgress = {};
 
         $scope.localStateTotal = {
             bytes: 0,
@@ -69,9 +70,9 @@ angular.module('syncthing.core')
             'touch': 'Update'
         };
         $scope.needIcons = {
-            'rm': 'remove',
-            'rmdir': 'remove',
-            'sync': 'download',
+            'rm': 'trash-o',
+            'rmdir': 'trash-o',
+            'sync': 'arrow-circle-o-down',
             'touch': 'asterisk'
         };
 
@@ -89,6 +90,12 @@ angular.module('syncthing.core')
             refreshFolderStats();
 
             $http.get(urlbase + '/system/version').success(function (data) {
+                if ($scope.version.version && $scope.version.version != data.version) {
+                    // We already have a version response, but it differs from
+                    // the new one. Reload the full GUI in case it's changed.
+                    document.location.reload(true);
+                }
+
                 $scope.version = data;
             }).error($scope.emitHTTPError);
 
@@ -157,6 +164,12 @@ angular.module('syncthing.core')
                 if (data.to === 'syncing') {
                     $scope.failed[data.folder] = [];
                 }
+
+                // If a folder has started scanning, then any scan progress is
+                // also obsolete.
+                if (data.to === 'scanning') {
+                    delete $scope.scanProgress[data.folder];
+                }
             }
         });
 
@@ -165,7 +178,7 @@ angular.module('syncthing.core')
         });
 
         $scope.$on(Events.DEVICE_DISCONNECTED, function (event, arg) {
-            delete $scope.connections[arg.data.id];
+            $scope.connections[arg.data.id].connected = false;
             refreshDeviceStats();
         });
 
@@ -176,6 +189,7 @@ angular.module('syncthing.core')
                     outbps: 0,
                     inBytesTotal: 0,
                     outBytesTotal: 0,
+                    type: arg.data.type,
                     address: arg.data.addr
                 };
                 $scope.completion[arg.data.id] = {
@@ -206,6 +220,14 @@ angular.module('syncthing.core')
 
         $scope.$on(Events.DEVICE_REJECTED, function (event, arg) {
             $scope.deviceRejections[arg.data.device] = arg;
+        });
+
+        $scope.$on(Events.DEVICE_PAUSED, function (event, arg) {
+            $scope.connections[arg.data.device].paused = true;
+        });
+
+        $scope.$on(Events.DEVICE_RESUMED, function (event, arg) {
+            $scope.connections[arg.data.device].paused = false;
         });
 
         $scope.$on(Events.FOLDER_REJECTED, function (event, arg) {
@@ -295,6 +317,15 @@ angular.module('syncthing.core')
             $scope.failed[data.folder] = data.errors;
         });
 
+        $scope.$on(Events.FOLDER_SCAN_PROGRESS, function (event, arg) {
+            var data = arg.data;
+            $scope.scanProgress[data.folder] = {
+                current: data.current,
+                total: data.total
+            };
+            console.log("FolderScanProgress", data);
+        });
+
         $scope.emitHTTPError = function (data, status, headers, config) {
             $scope.$emit('HTTPError', {data: data, status: status, headers: headers, config: config});
         };
@@ -346,15 +377,26 @@ angular.module('syncthing.core')
             $http.get(urlbase + '/system/status').success(function (data) {
                 $scope.myID = data.myID;
                 $scope.system = data;
-                $scope.announceServersTotal = data.extAnnounceOK ? Object.keys(data.extAnnounceOK).length : 0;
-                var failed = [];
-                for (var server in data.extAnnounceOK) {
-                    if (!data.extAnnounceOK[server]) {
-                        failed.push(server);
+
+                $scope.discoveryTotal = data.discoveryMethods;
+                var discoveryFailed = [];
+                for (var disco in data.discoveryErrors) {
+                    if (data.discoveryErrors[disco]) {
+                        discoveryFailed.push(disco + ": " + data.discoveryErrors[disco]);
                     }
                 }
-                $scope.announceServersFailed = failed;
+                $scope.discoveryFailed = discoveryFailed;
 
+                var relaysFailed = [];
+                var relaysTotal = 0;
+                for (var relay in data.relayClientStatus) {
+                    if (!data.relayClientStatus[relay]) {
+                        relaysFailed.push(relay);
+                    }
+                    relaysTotal++;
+                }
+                $scope.relaysFailed = relaysFailed;
+                $scope.relaysTotal = relaysTotal;
 
                 console.log("refreshSystem", data);
             }).error($scope.emitHTTPError);
@@ -609,12 +651,28 @@ angular.module('syncthing.core')
             return Math.floor(pct);
         };
 
+        $scope.scanPercentage = function (folder) {
+            if (!$scope.scanProgress[folder]) {
+                return undefined;
+            }
+            var pct = 100 * $scope.scanProgress[folder].current / $scope.scanProgress[folder].total;
+            return Math.floor(pct);
+        }
+
         $scope.deviceStatus = function (deviceCfg) {
             if ($scope.deviceFolders(deviceCfg).length === 0) {
                 return 'unused';
             }
 
-            if ($scope.connections[deviceCfg.deviceID]) {
+            if (typeof $scope.connections[deviceCfg.deviceID] === 'undefined') {
+                return 'unknown';
+            }
+
+            if ($scope.connections[deviceCfg.deviceID].paused) {
+                return 'paused';
+            }
+
+            if ($scope.connections[deviceCfg.deviceID].connected) {
                 if ($scope.completion[deviceCfg.deviceID] && $scope.completion[deviceCfg.deviceID]._total === 100) {
                     return 'insync';
                 } else {
@@ -632,7 +690,15 @@ angular.module('syncthing.core')
                 return 'warning';
             }
 
-            if ($scope.connections[deviceCfg.deviceID]) {
+            if (typeof $scope.connections[deviceCfg.deviceID] === 'undefined') {
+                return 'info';
+            }
+
+            if ($scope.connections[deviceCfg.deviceID].paused) {
+                return 'default';
+            }
+
+            if ($scope.connections[deviceCfg.deviceID].connected) {
                 if ($scope.completion[deviceCfg.deviceID] && $scope.completion[deviceCfg.deviceID]._total === 100) {
                     return 'success';
                 } else {
@@ -646,7 +712,7 @@ angular.module('syncthing.core')
 
         $scope.deviceAddr = function (deviceCfg) {
             var conn = $scope.connections[deviceCfg.deviceID];
-            if (conn) {
+            if (conn && conn.connected) {
                 return conn.address;
             }
             return '?';
@@ -689,6 +755,14 @@ angular.module('syncthing.core')
                 return device.name;
             }
             return device.deviceID.substr(0, 6);
+        };
+
+        $scope.pauseDevice = function (device) {
+            $http.post(urlbase + "/system/pause?device=" + device);
+        };
+
+        $scope.resumeDevice = function (device) {
+            $http.post(urlbase + "/system/resume?device=" + device);
         };
 
         $scope.editSettings = function () {
@@ -969,13 +1043,16 @@ angular.module('syncthing.core')
         };
 
         $scope.errorList = function () {
+            if (!$scope.errors) {
+                return [];
+            }
             return $scope.errors.filter(function (e) {
-                return e.time > $scope.seenError;
+                return e.when > $scope.seenError;
             });
         };
 
         $scope.clearErrors = function () {
-            $scope.seenError = $scope.errors[$scope.errors.length - 1].time;
+            $scope.seenError = $scope.errors[$scope.errors.length - 1].when;
             $http.post(urlbase + '/system/error/clear');
         };
 
@@ -1058,6 +1135,7 @@ angular.module('syncthing.core')
             };
             $scope.currentFolder.rescanIntervalS = 60;
             $scope.currentFolder.minDiskFreePct = 1;
+            $scope.currentFolder.maxConflicts = -1;
             $scope.currentFolder.order = "random";
             $scope.currentFolder.fileVersioningSelector = "none";
             $scope.currentFolder.trashcanClean = 0;
@@ -1079,6 +1157,8 @@ angular.module('syncthing.core')
                 selectedDevices: {},
                 rescanIntervalS: 60,
                 minDiskFreePct: 1,
+                maxConflicts: -1,
+                order: "random",
                 fileVersioningSelector: "none",
                 trashcanClean: 0,
                 simpleKeep: 5,

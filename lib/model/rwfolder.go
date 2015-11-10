@@ -16,12 +16,12 @@ import (
 	"sort"
 	"time"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/symlinks"
 	"github.com/syncthing/syncthing/lib/sync"
@@ -29,12 +29,6 @@ import (
 )
 
 // TODO: Stop on errors
-
-const (
-	pauseIntv     = 60 * time.Second
-	nextPullIntv  = 10 * time.Second
-	shortPullIntv = time.Second
-)
 
 // A pullBlockState is passed to the puller routine for each block that needs
 // to be fetched.
@@ -55,7 +49,7 @@ const retainBits = os.ModeSetgid | os.ModeSetuid | os.ModeSticky
 
 var (
 	activity    = newDeviceActivity()
-	errNoDevice = errors.New("no available source device")
+	errNoDevice = errors.New("peers who had this file went away, or the file has changed while syncing. will retry later")
 )
 
 const (
@@ -64,6 +58,13 @@ const (
 	dbUpdateHandleFile
 	dbUpdateDeleteFile
 	dbUpdateShortcutFile
+)
+
+const (
+	defaultCopiers     = 1
+	defaultPullers     = 16
+	defaultPullerSleep = 10 * time.Second
+	defaultPullerPause = 60 * time.Second
 )
 
 type dbUpdateJob struct {
@@ -78,15 +79,18 @@ type rwFolder struct {
 	progressEmitter  *ProgressEmitter
 	virtualMtimeRepo *db.VirtualMtimeRepo
 
-	folder      string
-	dir         string
-	scanIntv    time.Duration
-	versioner   versioner.Versioner
-	ignorePerms bool
-	copiers     int
-	pullers     int
-	shortID     uint64
-	order       config.PullOrder
+	folder       string
+	dir          string
+	scanIntv     time.Duration
+	versioner    versioner.Versioner
+	ignorePerms  bool
+	copiers      int
+	pullers      int
+	shortID      uint64
+	order        config.PullOrder
+	maxConflicts int
+	sleep        time.Duration
+	pause        time.Duration
 
 	stop        chan struct{}
 	queue       *jobQueue
@@ -102,7 +106,7 @@ type rwFolder struct {
 }
 
 func newRWFolder(m *Model, shortID uint64, cfg config.FolderConfiguration) *rwFolder {
-	return &rwFolder{
+	p := &rwFolder{
 		stateTracker: stateTracker{
 			folder: cfg.ID,
 			mut:    sync.NewMutex(),
@@ -112,18 +116,19 @@ func newRWFolder(m *Model, shortID uint64, cfg config.FolderConfiguration) *rwFo
 		progressEmitter:  m.progressEmitter,
 		virtualMtimeRepo: db.NewVirtualMtimeRepo(m.db, cfg.ID),
 
-		folder:      cfg.ID,
-		dir:         cfg.Path(),
-		scanIntv:    time.Duration(cfg.RescanIntervalS) * time.Second,
-		ignorePerms: cfg.IgnorePerms,
-		copiers:     cfg.Copiers,
-		pullers:     cfg.Pullers,
-		shortID:     shortID,
-		order:       cfg.Order,
+		folder:       cfg.ID,
+		dir:          cfg.Path(),
+		scanIntv:     time.Duration(cfg.RescanIntervalS) * time.Second,
+		ignorePerms:  cfg.IgnorePerms,
+		copiers:      cfg.Copiers,
+		pullers:      cfg.Pullers,
+		shortID:      shortID,
+		order:        cfg.Order,
+		maxConflicts: cfg.MaxConflicts,
 
 		stop:        make(chan struct{}),
 		queue:       newJobQueue(),
-		pullTimer:   time.NewTimer(shortPullIntv),
+		pullTimer:   time.NewTimer(time.Second),
 		scanTimer:   time.NewTimer(time.Millisecond), // The first scan should be done immediately.
 		delayScan:   make(chan time.Duration),
 		scanNow:     make(chan rescanRequest),
@@ -131,6 +136,27 @@ func newRWFolder(m *Model, shortID uint64, cfg config.FolderConfiguration) *rwFo
 
 		errorsMut: sync.NewMutex(),
 	}
+
+	if p.copiers == 0 {
+		p.copiers = defaultCopiers
+	}
+	if p.pullers == 0 {
+		p.pullers = defaultPullers
+	}
+
+	if cfg.PullerPauseS == 0 {
+		p.pause = defaultPullerPause
+	} else {
+		p.pause = time.Duration(cfg.PullerPauseS) * time.Second
+	}
+
+	if cfg.PullerSleepS == 0 {
+		p.sleep = defaultPullerSleep
+	} else {
+		p.sleep = time.Duration(cfg.PullerSleepS) * time.Second
+	}
+
+	return p
 }
 
 // Helper function to check whether either the ignorePerm flag has been
@@ -143,10 +169,8 @@ func (p *rwFolder) ignorePermissions(file protocol.FileInfo) bool {
 // Serve will run scans and pulls. It will return when Stop()ed or on a
 // critical error.
 func (p *rwFolder) Serve() {
-	if debug {
-		l.Debugln(p, "starting")
-		defer l.Debugln(p, "exiting")
-	}
+	l.Debugln(p, "starting")
+	defer l.Debugln(p, "exiting")
 
 	defer func() {
 		p.pullTimer.Stop()
@@ -168,9 +192,7 @@ func (p *rwFolder) Serve() {
 		sleepNanos := (p.scanIntv.Nanoseconds()*3 + rand.Int63n(2*p.scanIntv.Nanoseconds())) / 4
 		intv := time.Duration(sleepNanos) * time.Nanosecond
 
-		if debug {
-			l.Debugln(p, "next rescan in", intv)
-		}
+		l.Debugln(p, "next rescan in", intv)
 		p.scanTimer.Reset(intv)
 	}
 
@@ -184,17 +206,13 @@ func (p *rwFolder) Serve() {
 
 		case <-p.remoteIndex:
 			prevVer = 0
-			p.pullTimer.Reset(shortPullIntv)
-			if debug {
-				l.Debugln(p, "remote index updated, rescheduling pull")
-			}
+			p.pullTimer.Reset(0)
+			l.Debugln(p, "remote index updated, rescheduling pull")
 
 		case <-p.pullTimer.C:
 			if !initialScanCompleted {
-				if debug {
-					l.Debugln(p, "skip (initial)")
-				}
-				p.pullTimer.Reset(nextPullIntv)
+				l.Debugln(p, "skip (initial)")
+				p.pullTimer.Reset(p.sleep)
 				continue
 			}
 
@@ -205,9 +223,7 @@ func (p *rwFolder) Serve() {
 			if newHash := curIgnores.Hash(); newHash != prevIgnoreHash {
 				// The ignore patterns have changed. We need to re-evaluate if
 				// there are files we need now that were ignored before.
-				if debug {
-					l.Debugln(p, "ignore patterns have changed, resetting prevVer")
-				}
+				l.Debugln(p, "ignore patterns have changed, resetting prevVer")
 				prevVer = 0
 				prevIgnoreHash = newHash
 			}
@@ -215,16 +231,18 @@ func (p *rwFolder) Serve() {
 			// RemoteLocalVersion() is a fast call, doesn't touch the database.
 			curVer, ok := p.model.RemoteLocalVersion(p.folder)
 			if !ok || curVer == prevVer {
-				if debug {
-					l.Debugln(p, "skip (curVer == prevVer)", prevVer, ok)
-				}
-				p.pullTimer.Reset(nextPullIntv)
+				l.Debugln(p, "skip (curVer == prevVer)", prevVer, ok)
+				p.pullTimer.Reset(p.sleep)
 				continue
 			}
 
-			if debug {
-				l.Debugln(p, "pulling", prevVer, curVer)
+			if err := p.model.CheckFolderHealth(p.folder); err != nil {
+				l.Infoln("Skipping folder", p.folder, "pull due to folder error:", err)
+				p.pullTimer.Reset(p.sleep)
+				continue
 			}
+
+			l.Debugln(p, "pulling", prevVer, curVer)
 
 			p.setState(FolderSyncing)
 			p.clearErrors()
@@ -234,9 +252,7 @@ func (p *rwFolder) Serve() {
 				tries++
 
 				changed := p.pullerIteration(curIgnores)
-				if debug {
-					l.Debugln(p, "changed", changed)
-				}
+				l.Debugln(p, "changed", changed)
 
 				if changed == 0 {
 					// No files were changed by the puller, so we are in
@@ -256,10 +272,8 @@ func (p *rwFolder) Serve() {
 						curVer = lv
 					}
 					prevVer = curVer
-					if debug {
-						l.Debugln(p, "next pull in", nextPullIntv)
-					}
-					p.pullTimer.Reset(nextPullIntv)
+					l.Debugln(p, "next pull in", p.sleep)
+					p.pullTimer.Reset(p.sleep)
 					break
 				}
 
@@ -268,10 +282,8 @@ func (p *rwFolder) Serve() {
 					// we're not making it. Probably there are write
 					// errors preventing us. Flag this with a warning and
 					// wait a bit longer before retrying.
-					l.Infof("Folder %q isn't making progress. Pausing puller for %v.", p.folder, pauseIntv)
-					if debug {
-						l.Debugln(p, "next pull in", pauseIntv)
-					}
+					l.Infof("Folder %q isn't making progress. Pausing puller for %v.", p.folder, p.pause)
+					l.Debugln(p, "next pull in", p.pause)
 
 					if folderErrors := p.currentErrors(); len(folderErrors) > 0 {
 						events.Default.Log(events.FolderErrors, map[string]interface{}{
@@ -280,7 +292,7 @@ func (p *rwFolder) Serve() {
 						})
 					}
 
-					p.pullTimer.Reset(pauseIntv)
+					p.pullTimer.Reset(p.pause)
 					break
 				}
 			}
@@ -296,9 +308,7 @@ func (p *rwFolder) Serve() {
 				continue
 			}
 
-			if debug {
-				l.Debugln(p, "rescan")
-			}
+			l.Debugln(p, "rescan")
 
 			if err := p.model.internalScanFolderSubs(p.folder, nil); err != nil {
 				// Potentially sets the error twice, once in the scanner just
@@ -325,9 +335,7 @@ func (p *rwFolder) Serve() {
 				continue
 			}
 
-			if debug {
-				l.Debugln(p, "forced rescan")
-			}
+			l.Debugln(p, "forced rescan")
 
 			if err := p.model.internalScanFolderSubs(p.folder, req.subs); err != nil {
 				// Potentially sets the error twice, once in the scanner just
@@ -389,9 +397,7 @@ func (p *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
 	pullWg := sync.NewWaitGroup()
 	doneWg := sync.NewWaitGroup()
 
-	if debug {
-		l.Debugln(p, "c", p.copiers, "p", p.pullers)
-	}
+	l.Debugln(p, "c", p.copiers, "p", p.pullers)
 
 	p.dbUpdates = make(chan dbUpdateJob)
 	updateWg.Add(1)
@@ -437,7 +443,6 @@ func (p *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
 	// !!!
 
 	changed := 0
-	pullFileSize := int64(0)
 
 	fileDeletions := map[string]protocol.FileInfo{}
 	dirDeletions := []protocol.FileInfo{}
@@ -455,9 +460,7 @@ func (p *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
 			return true
 		}
 
-		if debug {
-			l.Debugln(p, "handling", file.Name)
-		}
+		l.Debugln(p, "handling", file.Name)
 
 		switch {
 		case file.IsDeleted():
@@ -479,31 +482,17 @@ func (p *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
 			}
 		case file.IsDirectory() && !file.IsSymlink():
 			// A new or changed directory
-			if debug {
-				l.Debugln("Creating directory", file.Name)
-			}
+			l.Debugln("Creating directory", file.Name)
 			p.handleDir(file)
 		default:
 			// A new or changed file or symlink. This is the only case where we
 			// do stuff concurrently in the background
-			pullFileSize += file.Size()
 			p.queue.Push(file.Name, file.Size(), file.Modified)
 		}
 
 		changed++
 		return true
 	})
-
-	// Check if we are able to store all files on disk
-	if pullFileSize > 0 {
-		folder, ok := p.model.cfg.Folders()[p.folder]
-		if ok {
-			if free, err := osutil.DiskFreeBytes(folder.Path()); err == nil && free < pullFileSize {
-				l.Infof("Puller (folder %q): insufficient disk space available to pull %d files (%.2fMB)", p.folder, changed, float64(pullFileSize)/1024/1024)
-				return 0
-			}
-		}
-	}
 
 	// Reorder the file queue according to configuration
 
@@ -519,7 +508,7 @@ func (p *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
 	case config.OrderOldestFirst:
 		p.queue.SortOldestFirst()
 	case config.OrderNewestFirst:
-		p.queue.SortOldestFirst()
+		p.queue.SortNewestFirst()
 	}
 
 	// Process the file queue
@@ -584,17 +573,13 @@ nextFile:
 	doneWg.Wait()
 
 	for _, file := range fileDeletions {
-		if debug {
-			l.Debugln("Deleting file", file.Name)
-		}
+		l.Debugln("Deleting file", file.Name)
 		p.deleteFile(file)
 	}
 
 	for i := range dirDeletions {
 		dir := dirDeletions[len(dirDeletions)-i-1]
-		if debug {
-			l.Debugln("Deleting dir", dir.Name)
-		}
+		l.Debugln("Deleting dir", dir.Name)
 		p.deleteDir(dir)
 	}
 
@@ -631,7 +616,7 @@ func (p *rwFolder) handleDir(file protocol.FileInfo) {
 		mode = 0777
 	}
 
-	if debug {
+	if shouldDebug() {
 		curFile, _ := p.model.CurrentFolderFile(p.folder, file.Name)
 		l.Debugf("need dir\n\t%v\n\t%v", file, curFile)
 	}
@@ -774,7 +759,7 @@ func (p *rwFolder) deleteFile(file protocol.FileInfo) {
 		// of deleting. Also merge with the version vector we had, to indicate
 		// we have resolved the conflict.
 		file.Version = file.Version.Merge(cur.Version)
-		err = osutil.InWritableDir(moveForConflict, realName)
+		err = osutil.InWritableDir(p.moveForConflict, realName)
 	} else if p.versioner != nil {
 		err = osutil.InWritableDir(p.versioner.Archive, realName)
 	} else {
@@ -829,9 +814,7 @@ func (p *rwFolder) renameFile(source, target protocol.FileInfo) {
 		})
 	}()
 
-	if debug {
-		l.Debugln(p, "taking rename shortcut", source.Name, "->", target.Name)
-	}
+	l.Debugln(p, "taking rename shortcut", source.Name, "->", target.Name)
 
 	from := filepath.Join(p.dir, source.Name)
 	to := filepath.Join(p.dir, target.Name)
@@ -913,15 +896,13 @@ func (p *rwFolder) renameFile(source, target protocol.FileInfo) {
 // handleFile queues the copies and pulls as necessary for a single new or
 // changed file.
 func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocksState, finisherChan chan<- *sharedPullerState) {
-	curFile, ok := p.model.CurrentFolderFile(p.folder, file.Name)
+	curFile, hasCurFile := p.model.CurrentFolderFile(p.folder, file.Name)
 
-	if ok && len(curFile.Blocks) == len(file.Blocks) && scanner.BlocksEqual(curFile.Blocks, file.Blocks) {
+	if hasCurFile && len(curFile.Blocks) == len(file.Blocks) && scanner.BlocksEqual(curFile.Blocks, file.Blocks) {
 		// We are supposed to copy the entire file, and then fetch nothing. We
 		// are only updating metadata, so we don't actually *need* to make the
 		// copy.
-		if debug {
-			l.Debugln(p, "taking shortcut on", file.Name)
-		}
+		l.Debugln(p, "taking shortcut on", file.Name)
 
 		events.Default.Log(events.ItemStarted, map[string]string{
 			"folder": p.folder,
@@ -957,6 +938,37 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 		return
 	}
 
+	// Figure out the absolute filenames we need once and for all
+	tempName := filepath.Join(p.dir, defTempNamer.TempName(file.Name))
+	realName := filepath.Join(p.dir, file.Name)
+
+	if hasCurFile && !curFile.IsDirectory() && !curFile.IsSymlink() {
+		// Check that the file on disk is what we expect it to be according to
+		// the database. If there's a mismatch here, there might be local
+		// changes that we don't know about yet and we should scan before
+		// touching the file. If we can't stat the file we'll just pull it.
+		if info, err := osutil.Lstat(realName); err == nil {
+			if info.ModTime().Unix() != curFile.Modified || info.Size() != curFile.Size() {
+				l.Debugln("file modified but not rescanned; not pulling:", realName)
+				// Scan() is synchronous (i.e. blocks until the scan is
+				// completed and returns an error), but a scan can't happen
+				// while we're in the puller routine. Request the scan in the
+				// background and it'll be handled when the current pulling
+				// sweep is complete. As we do retries, we'll queue the scan
+				// for this file up to ten times, but the last nine of those
+				// scans will be cheap...
+				go p.Scan([]string{file.Name})
+				return
+			}
+		}
+	}
+
+	if free, err := osutil.DiskFreeBytes(p.dir); err == nil && free < file.Size() {
+		l.Warnf(`Folder "%s": insufficient disk space in %s for %s: have %.2f MiB, need %.2f MiB`, p.folder, p.dir, file.Name, float64(free)/1024/1024, float64(file.Size())/1024/1024)
+		p.newError(file.Name, errors.New("insufficient space"))
+		return
+	}
+
 	events.Default.Log(events.ItemStarted, map[string]string{
 		"folder": p.folder,
 		"item":   file.Name,
@@ -966,16 +978,12 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 
 	scanner.PopulateOffsets(file.Blocks)
 
-	// Figure out the absolute filenames we need once and for all
-	tempName := filepath.Join(p.dir, defTempNamer.TempName(file.Name))
-	realName := filepath.Join(p.dir, file.Name)
-
 	reused := 0
 	var blocks []protocol.BlockInfo
 
 	// Check for an old temporary file which might have some blocks we could
 	// reuse.
-	tempBlocks, err := scanner.HashFile(tempName, protocol.BlockSize)
+	tempBlocks, err := scanner.HashFile(tempName, protocol.BlockSize, 0, nil)
 	if err == nil {
 		// Check for any reusable blocks in the temp file
 		tempCopyBlocks, _ := scanner.BlockDiff(tempBlocks, file.Blocks)
@@ -1001,7 +1009,7 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 			// Otherwise, discard the file ourselves in order for the
 			// sharedpuller not to panic when it fails to exclusively create a
 			// file which already exists
-			os.Remove(tempName)
+			osutil.InWritableDir(osutil.Remove, tempName)
 		}
 	} else {
 		blocks = file.Blocks
@@ -1020,9 +1028,7 @@ func (p *rwFolder) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocks
 		mut:         sync.NewMutex(),
 	}
 
-	if debug {
-		l.Debugf("%v need file %s; copy %d, reused %v", p, file.Name, len(blocks), reused)
-	}
+	l.Debugf("%v need file %s; copy %d, reused %v", p, file.Name, len(blocks), reused)
 
 	cs := copyBlocksState{
 		sharedPullerState: &s,
@@ -1067,7 +1073,11 @@ func (p *rwFolder) shortcutFile(file protocol.FileInfo) error {
 
 // shortcutSymlink changes the symlinks type if necessary.
 func (p *rwFolder) shortcutSymlink(file protocol.FileInfo) (err error) {
-	err = symlinks.ChangeType(filepath.Join(p.dir, file.Name), file.Flags)
+	tt := symlinks.TargetFile
+	if file.IsDirectory() {
+		tt = symlinks.TargetDirectory
+	}
+	err = symlinks.ChangeType(filepath.Join(p.dir, file.Name), tt)
 	if err != nil {
 		l.Infof("Puller (folder %q, file %q): symlink shortcut: %v", p.folder, file.Name, err)
 		p.newError(file.Name, err)
@@ -1093,15 +1103,17 @@ func (p *rwFolder) copierRoutine(in <-chan copyBlocksState, pullChan chan<- pull
 		}
 
 		folderRoots := make(map[string]string)
+		var folders []string
 		p.model.fmut.RLock()
 		for folder, cfg := range p.model.folderCfgs {
 			folderRoots[folder] = cfg.Path()
+			folders = append(folders, folder)
 		}
 		p.model.fmut.RUnlock()
 
 		for _, block := range state.blocks {
 			buf = buf[:int(block.Size)]
-			found := p.model.finder.Iterate(block.Hash, func(folder, file string, index int32) bool {
+			found := p.model.finder.Iterate(folders, block.Hash, func(folder, file string, index int32) bool {
 				fd, err := os.Open(filepath.Join(folderRoots[folder], file))
 				if err != nil {
 					return false
@@ -1116,14 +1128,12 @@ func (p *rwFolder) copierRoutine(in <-chan copyBlocksState, pullChan chan<- pull
 				hash, err := scanner.VerifyBuffer(buf, block)
 				if err != nil {
 					if hash != nil {
-						if debug {
-							l.Debugf("Finder block mismatch in %s:%s:%d expected %q got %q", folder, file, index, block.Hash, hash)
-						}
+						l.Debugf("Finder block mismatch in %s:%s:%d expected %q got %q", folder, file, index, block.Hash, hash)
 						err = p.model.finder.Fix(folder, file, index, block.Hash, hash)
 						if err != nil {
 							l.Warnln("finder fix:", err)
 						}
-					} else if debug {
+					} else {
 						l.Debugln("Finder failed to verify buffer", err)
 					}
 					return false
@@ -1198,9 +1208,7 @@ func (p *rwFolder) pullerRoutine(in <-chan pullBlockState, out chan<- *sharedPul
 			buf, lastError := p.model.requestGlobal(selected, p.folder, state.file.Name, state.block.Offset, int(state.block.Size), state.block.Hash, 0, nil)
 			activity.done(selected)
 			if lastError != nil {
-				if debug {
-					l.Debugln("request:", p.folder, state.file.Name, state.block.Offset, state.block.Size, "returned error:", lastError)
-				}
+				l.Debugln("request:", p.folder, state.file.Name, state.block.Offset, state.block.Size, "returned error:", lastError)
 				continue
 			}
 
@@ -1208,9 +1216,7 @@ func (p *rwFolder) pullerRoutine(in <-chan pullBlockState, out chan<- *sharedPul
 			// try pulling it from another device.
 			_, lastError = scanner.VerifyBuffer(buf, state.block)
 			if lastError != nil {
-				if debug {
-					l.Debugln("request:", p.folder, state.file.Name, state.block.Offset, state.block.Size, "hash mismatch")
-				}
+				l.Debugln("request:", p.folder, state.file.Name, state.block.Offset, state.block.Size, "hash mismatch")
 				continue
 			}
 
@@ -1246,34 +1252,48 @@ func (p *rwFolder) performFinish(state *sharedPullerState) error {
 		p.virtualMtimeRepo.UpdateMtime(state.file.Name, info.ModTime(), t)
 	}
 
-	var err error
-	if p.inConflict(state.version, state.file.Version) {
-		// The new file has been changed in conflict with the existing one. We
-		// should file it away as a conflict instead of just removing or
-		// archiving. Also merge with the version vector we had, to indicate
-		// we have resolved the conflict.
-		state.file.Version = state.file.Version.Merge(state.version)
-		err = osutil.InWritableDir(moveForConflict, state.realName)
-	} else if p.versioner != nil {
-		// If we should use versioning, let the versioner archive the old
-		// file before we replace it. Archiving a non-existent file is not
-		// an error.
-		err = p.versioner.Archive(state.realName)
-	} else {
-		err = nil
-	}
-	if err != nil {
-		return err
+	if stat, err := osutil.Lstat(state.realName); err == nil {
+		// There is an old file or directory already in place. We need to
+		// handle that.
+
+		switch {
+		case stat.IsDir() || stat.Mode()&os.ModeSymlink != 0:
+			// It's a directory or a symlink. These are not versioned or
+			// archived for conflicts, only removed (which of course fails for
+			// non-empty directories).
+
+			// TODO: This is the place where we want to remove temporary files
+			// and future hard ignores before attempting a directory delete.
+			// Should share code with p.deletDir().
+
+			if err = osutil.InWritableDir(osutil.Remove, state.realName); err != nil {
+				return err
+			}
+
+		case p.inConflict(state.version, state.file.Version):
+			// The new file has been changed in conflict with the existing one. We
+			// should file it away as a conflict instead of just removing or
+			// archiving. Also merge with the version vector we had, to indicate
+			// we have resolved the conflict.
+
+			state.file.Version = state.file.Version.Merge(state.version)
+			if err = osutil.InWritableDir(p.moveForConflict, state.realName); err != nil {
+				return err
+			}
+
+		case p.versioner != nil:
+			// If we should use versioning, let the versioner archive the old
+			// file before we replace it. Archiving a non-existent file is not
+			// an error.
+
+			if err = p.versioner.Archive(state.realName); err != nil {
+				return err
+			}
+		}
 	}
 
-	// If the target path is a symlink or a directory, we cannot copy
-	// over it, hence remove it before proceeding.
-	stat, err := osutil.Lstat(state.realName)
-	if err == nil && (stat.IsDir() || stat.Mode()&os.ModeSymlink != 0) {
-		osutil.InWritableDir(osutil.Remove, state.realName)
-	}
 	// Replace the original content with the new one
-	if err = osutil.Rename(state.tempName, state.realName); err != nil {
+	if err := osutil.Rename(state.tempName, state.realName); err != nil {
 		return err
 	}
 
@@ -1287,7 +1307,11 @@ func (p *rwFolder) performFinish(state *sharedPullerState) error {
 		// Remove the file, and replace it with a symlink.
 		err = osutil.InWritableDir(func(path string) error {
 			os.Remove(path)
-			return symlinks.Create(path, string(content), state.file.Flags)
+			tt := symlinks.TargetFile
+			if state.file.IsDirectory() {
+				tt = symlinks.TargetDirectory
+			}
+			return symlinks.Create(path, string(content), tt)
 		}, state.realName)
 		if err != nil {
 			return err
@@ -1302,9 +1326,7 @@ func (p *rwFolder) performFinish(state *sharedPullerState) error {
 func (p *rwFolder) finisherRoutine(in <-chan *sharedPullerState) {
 	for state := range in {
 		if closed, err := state.finalClose(); closed {
-			if debug {
-				l.Debugln(p, "closing", state.file.Name)
-			}
+			l.Debugln(p, "closing", state.file.Name)
 
 			p.queue.Done(state.file.Name)
 
@@ -1428,16 +1450,6 @@ func (p *rwFolder) inConflict(current, replacement protocol.Vector) bool {
 	return false
 }
 
-func invalidateFolder(cfg *config.Configuration, folderID string, err error) {
-	for i := range cfg.Folders {
-		folder := &cfg.Folders[i]
-		if folder.ID == folderID {
-			folder.Invalid = err.Error()
-			return
-		}
-	}
-}
-
 func removeDevice(devices []protocol.DeviceID, device protocol.DeviceID) []protocol.DeviceID {
 	for i := range devices {
 		if devices[i] == device {
@@ -1448,7 +1460,14 @@ func removeDevice(devices []protocol.DeviceID, device protocol.DeviceID) []proto
 	return devices
 }
 
-func moveForConflict(name string) error {
+func (p *rwFolder) moveForConflict(name string) error {
+	if p.maxConflicts == 0 {
+		if err := osutil.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
 	ext := filepath.Ext(name)
 	withoutExt := name[:len(name)-len(ext)]
 	newName := withoutExt + time.Now().Format(".sync-conflict-20060102-150405") + ext
@@ -1458,7 +1477,21 @@ func moveForConflict(name string) error {
 		// the user has already moved it away, or the conflict was between a
 		// remote modification and a local delete. In either way it does not
 		// matter, go ahead as if the move succeeded.
-		return nil
+		err = nil
+	}
+	if p.maxConflicts > -1 {
+		matches, gerr := osutil.Glob(withoutExt + ".sync-conflict-????????-??????" + ext)
+		if gerr == nil && len(matches) > p.maxConflicts {
+			sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+			for _, match := range matches[p.maxConflicts:] {
+				gerr = osutil.Remove(match)
+				if gerr != nil {
+					l.Debugln(p, "removing extra conflict", gerr)
+				}
+			}
+		} else if gerr != nil {
+			l.Debugln(p, "globbing for conflicts", gerr)
+		}
 	}
 	return err
 }

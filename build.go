@@ -13,7 +13,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
-	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
@@ -181,11 +180,13 @@ func setup() {
 	runPrint("go", "get", "-v", "golang.org/x/tools/cmd/vet")
 	runPrint("go", "get", "-v", "golang.org/x/net/html")
 	runPrint("go", "get", "-v", "github.com/tools/godep")
+	runPrint("go", "get", "-v", "github.com/axw/gocov/gocov")
+	runPrint("go", "get", "-v", "github.com/AlekSi/gocov-xml")
 }
 
 func test(pkg string) {
 	setBuildEnv()
-	runPrint("go", "test", "-short", "-timeout", "60s", pkg)
+	runPrint("go", "test", "-short", "-race", "-timeout", "60s", pkg)
 }
 
 func bench(pkg string) {
@@ -194,7 +195,11 @@ func bench(pkg string) {
 }
 
 func install(pkg string, tags []string) {
-	os.Setenv("GOBIN", "./bin")
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
+	os.Setenv("GOBIN", filepath.Join(cwd, "bin"))
 	args := []string{"install", "-v", "-ldflags", ldflags()}
 	if len(tags) > 0 {
 		args = append(args, "-tags", strings.Join(tags, ","))
@@ -213,7 +218,7 @@ func build(pkg string, tags []string) {
 		binary += ".exe"
 	}
 
-	rmr(binary, binary+".md5")
+	rmr(binary)
 	args := []string{"build", "-ldflags", ldflags()}
 	if len(tags) > 0 {
 		args = append(args, "-tags", strings.Join(tags, ","))
@@ -224,13 +229,6 @@ func build(pkg string, tags []string) {
 	args = append(args, pkg)
 	setBuildEnv()
 	runPrint("go", args...)
-
-	// Create an md5 checksum of the binary, to be included in the archive for
-	// automatic upgrades.
-	err := md5File(binary)
-	if err != nil {
-		log.Fatal(err)
-	}
 }
 
 func buildTar() {
@@ -247,7 +245,6 @@ func buildTar() {
 		{src: "LICENSE", dst: name + "/LICENSE.txt"},
 		{src: "AUTHORS", dst: name + "/AUTHORS.txt"},
 		{src: "syncthing", dst: name + "/syncthing"},
-		{src: "syncthing.md5", dst: name + "/syncthing.md5"},
 	}
 
 	for _, file := range listFiles("etc") {
@@ -275,7 +272,6 @@ func buildZip() {
 		{src: "LICENSE", dst: name + "/LICENSE.txt"},
 		{src: "AUTHORS", dst: name + "/AUTHORS.txt"},
 		{src: "syncthing.exe", dst: name + "/syncthing.exe"},
-		{src: "syncthing.exe.md5", dst: name + "/syncthing.exe.md5"},
 	}
 
 	for _, file := range listFiles("extra") {
@@ -405,16 +401,16 @@ func setBuildEnv() {
 
 func assets() {
 	setBuildEnv()
-	runPipe("lib/auto/gui.files.go", "go", "run", "cmd/genassets/main.go", "gui")
+	runPipe("lib/auto/gui.files.go", "go", "run", "script/genassets.go", "gui")
 }
 
 func xdr() {
-	runPrint("go", "generate", "./lib/discover", "./lib/db")
+	runPrint("go", "generate", "./lib/discover", "./lib/db", "./lib/protocol")
 }
 
 func translate() {
 	os.Chdir("gui/assets/lang")
-	runPipe("lang-en-new.json", "go", "run", "../../../cmd/translate/main.go", "lang-en.json", "../../")
+	runPipe("lang-en-new.json", "go", "run", "../../../script/translate.go", "lang-en.json", "../../")
 	os.Remove("lang-en.json")
 	err := os.Rename("lang-en-new.json", "lang-en.json")
 	if err != nil {
@@ -425,7 +421,7 @@ func translate() {
 
 func transifex() {
 	os.Chdir("gui/assets/lang")
-	runPrint("go", "run", "../../../cmd/transifexdl/main.go")
+	runPrint("go", "run", "../../../script/transifexdl.go")
 	os.Chdir("../../..")
 	assets()
 }
@@ -708,32 +704,6 @@ func zipFile(out string, files []archiveFile) {
 	if err != nil {
 		log.Fatal(err)
 	}
-}
-
-func md5File(file string) error {
-	fd, err := os.Open(file)
-	if err != nil {
-		return err
-	}
-	defer fd.Close()
-
-	h := md5.New()
-	_, err = io.Copy(h, fd)
-	if err != nil {
-		return err
-	}
-
-	out, err := os.Create(file + ".md5")
-	if err != nil {
-		return err
-	}
-
-	_, err = fmt.Fprintf(out, "%x\n", h.Sum(nil))
-	if err != nil {
-		return err
-	}
-
-	return out.Close()
 }
 
 func vet(pkg string) {

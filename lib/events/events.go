@@ -25,6 +25,8 @@ const (
 	DeviceConnected
 	DeviceDisconnected
 	DeviceRejected
+	DevicePaused
+	DeviceResumed
 	LocalIndexUpdated
 	RemoteIndexUpdated
 	ItemStarted
@@ -36,6 +38,9 @@ const (
 	FolderSummary
 	FolderCompletion
 	FolderErrors
+	FolderScanProgress
+	ExternalPortMappingChanged
+	RelayStateChanged
 
 	AllEvents = (1 << iota) - 1
 )
@@ -78,6 +83,16 @@ func (t EventType) String() string {
 		return "FolderCompletion"
 	case FolderErrors:
 		return "FolderErrors"
+	case DevicePaused:
+		return "DevicePaused"
+	case DeviceResumed:
+		return "DeviceResumed"
+	case FolderScanProgress:
+		return "FolderScanProgress"
+	case ExternalPortMappingChanged:
+		return "ExternalPortMappingChanged"
+	case RelayStateChanged:
+		return "RelayStateChanged"
 	default:
 		return "Unknown"
 	}
@@ -90,7 +105,7 @@ func (t EventType) MarshalText() ([]byte, error) {
 const BufferSize = 64
 
 type Logger struct {
-	subs   map[int]*Subscription
+	subs   []*Subscription
 	nextID int
 	mutex  sync.Mutex
 }
@@ -104,7 +119,6 @@ type Event struct {
 
 type Subscription struct {
 	mask    EventType
-	id      int
 	events  chan Event
 	timeout *time.Timer
 }
@@ -118,23 +132,20 @@ var (
 
 func NewLogger() *Logger {
 	return &Logger{
-		subs:  make(map[int]*Subscription),
 		mutex: sync.NewMutex(),
 	}
 }
 
 func (l *Logger) Log(t EventType, data interface{}) {
 	l.mutex.Lock()
-	if debug {
-		dl.Debugln("log", l.nextID, t.String(), data)
-	}
+	dl.Debugln("log", l.nextID, t, data)
+	l.nextID++
 	e := Event{
 		ID:   l.nextID,
 		Time: time.Now(),
 		Type: t,
 		Data: data,
 	}
-	l.nextID++
 	for _, s := range l.subs {
 		if s.mask&t != 0 {
 			select {
@@ -149,27 +160,29 @@ func (l *Logger) Log(t EventType, data interface{}) {
 
 func (l *Logger) Subscribe(mask EventType) *Subscription {
 	l.mutex.Lock()
-	if debug {
-		dl.Debugln("subscribe", mask)
-	}
+	dl.Debugln("subscribe", mask)
 	s := &Subscription{
 		mask:    mask,
-		id:      l.nextID,
 		events:  make(chan Event, BufferSize),
 		timeout: time.NewTimer(0),
 	}
-	l.nextID++
-	l.subs[s.id] = s
+	l.subs = append(l.subs, s)
 	l.mutex.Unlock()
 	return s
 }
 
 func (l *Logger) Unsubscribe(s *Subscription) {
 	l.mutex.Lock()
-	if debug {
-		dl.Debugln("unsubscribe")
+	dl.Debugln("unsubscribe")
+	for i, ss := range l.subs {
+		if s == ss {
+			last := len(l.subs) - 1
+			l.subs[i] = l.subs[last]
+			l.subs[last] = nil
+			l.subs = l.subs[:last]
+			break
+		}
 	}
-	delete(l.subs, s.id)
 	close(s.events)
 	l.mutex.Unlock()
 }
@@ -178,16 +191,21 @@ func (l *Logger) Unsubscribe(s *Subscription) {
 // out of the event channel is closed. Poll should not be called concurrently
 // from multiple goroutines for a single subscription.
 func (s *Subscription) Poll(timeout time.Duration) (Event, error) {
-	if debug {
-		dl.Debugln("poll", timeout)
+	dl.Debugln("poll", timeout)
+
+	if !s.timeout.Reset(timeout) {
+		select {
+		case <-s.timeout.C:
+		default:
+		}
 	}
 
-	s.timeout.Reset(timeout)
 	select {
 	case e, ok := <-s.events:
 		if !ok {
 			return e, ErrClosed
 		}
+		s.timeout.Stop()
 		return e, nil
 	case <-s.timeout.C:
 		return Event{}, ErrTimeout

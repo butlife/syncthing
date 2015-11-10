@@ -25,9 +25,9 @@ var (
 )
 
 func basicAuthAndSessionMiddleware(cookieName string, cfg config.GUIConfiguration, next http.Handler) http.Handler {
-
+	apiKey := cfg.APIKey()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cfg.APIKey != "" && r.Header.Get("X-API-Key") == cfg.APIKey {
+		if apiKey != "" && r.Header.Get("X-API-Key") == apiKey {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -43,9 +43,7 @@ func basicAuthAndSessionMiddleware(cookieName string, cfg config.GUIConfiguratio
 			}
 		}
 
-		if debugHTTP {
-			l.Debugln("Sessionless HTTP request with authentication; this is expensive.")
-		}
+		httpl.Debugln("Sessionless HTTP request with authentication; this is expensive.")
 
 		error := func() {
 			time.Sleep(time.Duration(rand.Intn(100)+100) * time.Millisecond)

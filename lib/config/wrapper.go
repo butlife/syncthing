@@ -9,9 +9,9 @@ package config
 import (
 	"os"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 )
 
@@ -60,10 +60,8 @@ type Wrapper struct {
 	deviceMap map[protocol.DeviceID]DeviceConfiguration
 	folderMap map[string]FolderConfiguration
 	replaces  chan Configuration
+	subs      []Committer
 	mut       sync.Mutex
-
-	subs []Committer
-	sMut sync.Mutex
 }
 
 // Wrap wraps an existing Configuration structure and ties it to a file on
@@ -73,7 +71,6 @@ func Wrap(path string, cfg Configuration) *Wrapper {
 		cfg:  cfg,
 		path: path,
 		mut:  sync.NewMutex(),
-		sMut: sync.NewMutex(),
 	}
 	w.replaces = make(chan Configuration)
 	return w
@@ -109,9 +106,24 @@ func (w *Wrapper) Stop() {
 // Subscribe registers the given handler to be called on any future
 // configuration changes.
 func (w *Wrapper) Subscribe(c Committer) {
-	w.sMut.Lock()
+	w.mut.Lock()
 	w.subs = append(w.subs, c)
-	w.sMut.Unlock()
+	w.mut.Unlock()
+}
+
+// Unsubscribe de-registers the given handler from any future calls to
+// configuration changes
+func (w *Wrapper) Unsubscribe(c Committer) {
+	w.mut.Lock()
+	for i := range w.subs {
+		if w.subs[i] == c {
+			copy(w.subs[i:], w.subs[i+1:])
+			w.subs[len(w.subs)-1] = nil
+			w.subs = w.subs[:len(w.subs)-1]
+			break
+		}
+	}
+	w.mut.Unlock()
 }
 
 // Raw returns the currently wrapped Configuration object.
@@ -130,13 +142,9 @@ func (w *Wrapper) replaceLocked(to Configuration) CommitResponse {
 	from := w.cfg
 
 	for _, sub := range w.subs {
-		if debug {
-			l.Debugln(sub, "verifying configuration")
-		}
+		l.Debugln(sub, "verifying configuration")
 		if err := sub.VerifyConfiguration(from, to); err != nil {
-			if debug {
-				l.Debugln(sub, "rejected config:", err)
-			}
+			l.Debugln(sub, "rejected config:", err)
 			return CommitResponse{
 				ValidationError: err,
 			}
@@ -145,14 +153,10 @@ func (w *Wrapper) replaceLocked(to Configuration) CommitResponse {
 
 	allOk := true
 	for _, sub := range w.subs {
-		if debug {
-			l.Debugln(sub, "committing configuration")
-		}
+		l.Debugln(sub, "committing configuration")
 		ok := sub.CommitConfiguration(from, to)
 		if !ok {
-			if debug {
-				l.Debugln(sub, "requires restart")
-			}
+			l.Debugln(sub, "requires restart")
 			allOk = false
 		}
 	}
@@ -301,4 +305,21 @@ func (w *Wrapper) Save() error {
 
 	events.Default.Log(events.ConfigSaved, w.cfg)
 	return nil
+}
+
+func (w *Wrapper) GlobalDiscoveryServers() []string {
+	var servers []string
+	for _, srv := range w.cfg.Options.GlobalAnnServers {
+		switch srv {
+		case "default":
+			servers = append(servers, DefaultDiscoveryServers...)
+		case "default-v4":
+			servers = append(servers, DefaultDiscoveryServersV4...)
+		case "default-v6":
+			servers = append(servers, DefaultDiscoveryServersV6...)
+		default:
+			servers = append(servers, srv)
+		}
+	}
+	return uniqueStrings(servers)
 }

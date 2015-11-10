@@ -16,12 +16,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"sort"
 
-	"github.com/syncthing/protocol"
-	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/osutil"
-	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syncthing/syncthing/lib/protocol"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -29,12 +26,14 @@ import (
 
 var blockFinder *BlockFinder
 
+const maxBatchSize = 256 << 10
+
 type BlockMap struct {
-	db     *leveldb.DB
+	db     *Instance
 	folder string
 }
 
-func NewBlockMap(db *leveldb.DB, folder string) *BlockMap {
+func NewBlockMap(db *Instance, folder string) *BlockMap {
 	return &BlockMap{
 		db:     db,
 		folder: folder,
@@ -45,14 +44,23 @@ func NewBlockMap(db *leveldb.DB, folder string) *BlockMap {
 func (m *BlockMap) Add(files []protocol.FileInfo) error {
 	batch := new(leveldb.Batch)
 	buf := make([]byte, 4)
+	var key []byte
 	for _, file := range files {
+		if batch.Len() > maxBatchSize {
+			if err := m.db.Write(batch, nil); err != nil {
+				return err
+			}
+			batch.Reset()
+		}
+
 		if file.IsDirectory() || file.IsDeleted() || file.IsInvalid() {
 			continue
 		}
 
 		for i, block := range file.Blocks {
 			binary.BigEndian.PutUint32(buf, uint32(i))
-			batch.Put(m.blockKey(block.Hash, file.Name), buf)
+			key = m.blockKeyInto(key, block.Hash, file.Name)
+			batch.Put(key, buf)
 		}
 	}
 	return m.db.Write(batch, nil)
@@ -62,21 +70,31 @@ func (m *BlockMap) Add(files []protocol.FileInfo) error {
 func (m *BlockMap) Update(files []protocol.FileInfo) error {
 	batch := new(leveldb.Batch)
 	buf := make([]byte, 4)
+	var key []byte
 	for _, file := range files {
+		if batch.Len() > maxBatchSize {
+			if err := m.db.Write(batch, nil); err != nil {
+				return err
+			}
+			batch.Reset()
+		}
+
 		if file.IsDirectory() {
 			continue
 		}
 
 		if file.IsDeleted() || file.IsInvalid() {
 			for _, block := range file.Blocks {
-				batch.Delete(m.blockKey(block.Hash, file.Name))
+				key = m.blockKeyInto(key, block.Hash, file.Name)
+				batch.Delete(key)
 			}
 			continue
 		}
 
 		for i, block := range file.Blocks {
 			binary.BigEndian.PutUint32(buf, uint32(i))
-			batch.Put(m.blockKey(block.Hash, file.Name), buf)
+			key = m.blockKeyInto(key, block.Hash, file.Name)
+			batch.Put(key, buf)
 		}
 	}
 	return m.db.Write(batch, nil)
@@ -85,9 +103,18 @@ func (m *BlockMap) Update(files []protocol.FileInfo) error {
 // Discard block map state, removing the given files
 func (m *BlockMap) Discard(files []protocol.FileInfo) error {
 	batch := new(leveldb.Batch)
+	var key []byte
 	for _, file := range files {
+		if batch.Len() > maxBatchSize {
+			if err := m.db.Write(batch, nil); err != nil {
+				return err
+			}
+			batch.Reset()
+		}
+
 		for _, block := range file.Blocks {
-			batch.Delete(m.blockKey(block.Hash, file.Name))
+			key = m.blockKeyInto(key, block.Hash, file.Name)
+			batch.Delete(key)
 		}
 	}
 	return m.db.Write(batch, nil)
@@ -96,9 +123,16 @@ func (m *BlockMap) Discard(files []protocol.FileInfo) error {
 // Drop block map, removing all entries related to this block map from the db.
 func (m *BlockMap) Drop() error {
 	batch := new(leveldb.Batch)
-	iter := m.db.NewIterator(util.BytesPrefix(m.blockKey(nil, "")[:1+64]), nil)
+	iter := m.db.NewIterator(util.BytesPrefix(m.blockKeyInto(nil, nil, "")[:1+64]), nil)
 	defer iter.Release()
 	for iter.Next() {
+		if batch.Len() > maxBatchSize {
+			if err := m.db.Write(batch, nil); err != nil {
+				return err
+			}
+			batch.Reset()
+		}
+
 		batch.Delete(iter.Key())
 	}
 	if iter.Error() != nil {
@@ -107,51 +141,24 @@ func (m *BlockMap) Drop() error {
 	return m.db.Write(batch, nil)
 }
 
-func (m *BlockMap) blockKey(hash []byte, file string) []byte {
-	return toBlockKey(hash, m.folder, file)
+func (m *BlockMap) blockKeyInto(o, hash []byte, file string) []byte {
+	return blockKeyInto(o, hash, m.folder, file)
 }
 
 type BlockFinder struct {
-	db      *leveldb.DB
-	folders []string
-	mut     sync.RWMutex
+	db *Instance
 }
 
-func NewBlockFinder(db *leveldb.DB, cfg *config.Wrapper) *BlockFinder {
+func NewBlockFinder(db *Instance) *BlockFinder {
 	if blockFinder != nil {
 		return blockFinder
 	}
 
 	f := &BlockFinder{
-		db:  db,
-		mut: sync.NewRWMutex(),
+		db: db,
 	}
-
-	f.CommitConfiguration(config.Configuration{}, cfg.Raw())
-	cfg.Subscribe(f)
 
 	return f
-}
-
-// VerifyConfiguration implementes the config.Committer interface
-func (f *BlockFinder) VerifyConfiguration(from, to config.Configuration) error {
-	return nil
-}
-
-// CommitConfiguration implementes the config.Committer interface
-func (f *BlockFinder) CommitConfiguration(from, to config.Configuration) bool {
-	folders := make([]string, len(to.Folders))
-	for i, folder := range to.Folders {
-		folders[i] = folder.ID
-	}
-
-	sort.Strings(folders)
-
-	f.mut.Lock()
-	f.folders = folders
-	f.mut.Unlock()
-
-	return true
 }
 
 func (f *BlockFinder) String() string {
@@ -163,12 +170,10 @@ func (f *BlockFinder) String() string {
 // they are happy with the block) or false to continue iterating for whatever
 // reason. The iterator finally returns the result, whether or not a
 // satisfying block was eventually found.
-func (f *BlockFinder) Iterate(hash []byte, iterFn func(string, string, int32) bool) bool {
-	f.mut.RLock()
-	folders := f.folders
-	f.mut.RUnlock()
+func (f *BlockFinder) Iterate(folders []string, hash []byte, iterFn func(string, string, int32) bool) bool {
+	var key []byte
 	for _, folder := range folders {
-		key := toBlockKey(hash, folder, "")
+		key = blockKeyInto(key, hash, folder, "")
 		iter := f.db.NewIterator(util.BytesPrefix(key), nil)
 		defer iter.Release()
 
@@ -190,8 +195,8 @@ func (f *BlockFinder) Fix(folder, file string, index int32, oldHash, newHash []b
 	binary.BigEndian.PutUint32(buf, uint32(index))
 
 	batch := new(leveldb.Batch)
-	batch.Delete(toBlockKey(oldHash, folder, file))
-	batch.Put(toBlockKey(newHash, folder, file), buf)
+	batch.Delete(blockKeyInto(nil, oldHash, folder, file))
+	batch.Put(blockKeyInto(nil, newHash, folder, file), buf)
 	return f.db.Write(batch, nil)
 }
 
@@ -200,8 +205,13 @@ func (f *BlockFinder) Fix(folder, file string, index int32, oldHash, newHash []b
 //	   folder (64 bytes)
 //	   block hash (32 bytes)
 //	   file name (variable size)
-func toBlockKey(hash []byte, folder, file string) []byte {
-	o := make([]byte, 1+64+32+len(file))
+func blockKeyInto(o, hash []byte, folder, file string) []byte {
+	reqLen := 1 + 64 + 32 + len(file)
+	if cap(o) < reqLen {
+		o = make([]byte, reqLen)
+	} else {
+		o = o[:reqLen]
+	}
 	o[0] = KeyTypeBlock
 	copy(o[1:], []byte(folder))
 	copy(o[1+64:], []byte(hash))

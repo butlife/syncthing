@@ -25,13 +25,14 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 )
 
-// We set the API key via the STGUIAPIKEY variable when we launch the binary,
-// to ensure that we have API access regardless of authentication settings.
+// APIKey is set via the STGUIAPIKEY variable when we launch the binary, to
+// ensure that we have API access regardless of authentication settings.
 const APIKey = "592A47BC-A7DF-4C2F-89E0-A80B3E5094EE"
 
 type Process struct {
@@ -156,6 +157,8 @@ func (p *Process) Get(path string) ([]byte, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
+			Dial:              dialer.Dial,
+			Proxy:             http.ProxyFromEnvironment,
 			DisableKeepAlives: true,
 		},
 	}
@@ -226,12 +229,12 @@ func (p *Process) Events(since int) ([]Event, error) {
 }
 
 func (p *Process) Rescan(folder string) error {
-	_, err := p.Post("/rest/db/scan?folder="+folder, nil)
+	_, err := p.Post("/rest/db/scan?folder="+url.QueryEscape(folder), nil)
 	return err
 }
 
 func (p *Process) RescanDelay(folder string, delaySeconds int) error {
-	_, err := p.Post(fmt.Sprintf("/rest/db/scan?folder=%s&next=%d", folder, delaySeconds), nil)
+	_, err := p.Post(fmt.Sprintf("/rest/db/scan?folder=%s&next=%d", url.QueryEscape(folder), delaySeconds), nil)
 	return err
 }
 
@@ -341,7 +344,7 @@ type Model struct {
 }
 
 func (p *Process) Model(folder string) (Model, error) {
-	bs, err := p.Get("/rest/db/status?folder=" + folder)
+	bs, err := p.Get("/rest/db/status?folder=" + url.QueryEscape(folder))
 	if err != nil {
 		return Model{}, err
 	}
@@ -351,9 +354,7 @@ func (p *Process) Model(folder string) (Model, error) {
 		return Model{}, err
 	}
 
-	if debug {
-		l.Debugf("%+v", res)
-	}
+	l.Debugf("%+v", res)
 
 	return res, nil
 }
@@ -506,9 +507,7 @@ func (p *Process) eventLoop() {
 				m[p.id.String()] = version
 				p.localVersion[folder] = m
 				p.done[folder] = false
-				if debug {
-					l.Debugf("LocalIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
-				}
+				l.Debugf("LocalIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
 				p.eventMut.Unlock()
 
 			case "RemoteIndexUpdated":
@@ -524,9 +523,7 @@ func (p *Process) eventLoop() {
 				m[device] = version
 				p.localVersion[folder] = m
 				p.done[folder] = false
-				if debug {
-					l.Debugf("RemoteIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
-				}
+				l.Debugf("RemoteIndexUpdated %v %v done=false\n\t%+v", p.id, folder, m)
 				p.eventMut.Unlock()
 
 			case "FolderSummary":
@@ -537,9 +534,7 @@ func (p *Process) eventLoop() {
 				done := need == 0
 				p.eventMut.Lock()
 				p.done[folder] = done
-				if debug {
-					l.Debugf("Foldersummary %v %v\n\t%+v", p.id, folder, p.done)
-				}
+				l.Debugf("Foldersummary %v %v\n\t%+v", p.id, folder, p.done)
 				p.eventMut.Unlock()
 			}
 		}

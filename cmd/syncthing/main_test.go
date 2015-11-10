@@ -10,13 +10,10 @@ import (
 	"os"
 	"testing"
 
-	"github.com/syncthing/protocol"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/model"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 func TestFolderErrors(t *testing.T) {
@@ -38,11 +35,11 @@ func TestFolderErrors(t *testing.T) {
 		}
 	}
 
-	ldb, _ := leveldb.Open(storage.NewMemStorage(), nil)
+	ldb := db.OpenMemory()
 
 	// Case 1 - new folder, directory and marker created
 
-	m := model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb)
+	m := model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb, nil)
 	m.AddFolder(fcfg)
 
 	if err := m.CheckFolderHealth("folder"); err != nil {
@@ -73,7 +70,7 @@ func TestFolderErrors(t *testing.T) {
 		Folders: []config.FolderConfiguration{fcfg},
 	})
 
-	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb)
+	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb, nil)
 	m.AddFolder(fcfg)
 
 	if err := m.CheckFolderHealth("folder"); err != nil {
@@ -96,7 +93,7 @@ func TestFolderErrors(t *testing.T) {
 		{Name: "dummyfile"},
 	})
 
-	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb)
+	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb, nil)
 	m.AddFolder(fcfg)
 
 	if err := m.CheckFolderHealth("folder"); err == nil || err.Error() != "folder marker missing" {
@@ -127,7 +124,7 @@ func TestFolderErrors(t *testing.T) {
 		Folders: []config.FolderConfiguration{fcfg},
 	})
 
-	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb)
+	m = model.NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", ldb, nil)
 	m.AddFolder(fcfg)
 
 	if err := m.CheckFolderHealth("folder"); err == nil || err.Error() != "folder path missing" {
